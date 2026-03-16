@@ -128,35 +128,24 @@ unsigned long lastFusionTime = 0;
 bool yawInitialized = false;
 float fusedYawDeg = 0.0f;
 bool yawWasRestoredFromNv = false;
-bool imuContinuityReady = false;
-float imuHeadingOffsetDeg = 0.0f;
 bool magHeadingFilteredReady = false;
 float magHeadingFilteredDeg = 0.0f;
-bool outputHeadingReady = false;
-float outputHeadingDeg = 0.0f;
-bool lastImuHeadingReady = false;
-float lastImuHeadingDeg = 0.0f;
 float referenceFieldNorm_uT = 0.0f;
 bool fieldReferenceReady = false;
 bool magDisturbed = false;
-bool headingAlignReady = false;
-float headingAlignOffsetDeg = 0.0f;
-float headingAlignOffsetAccum = 0.0f;
-uint32_t headingAlignOffsetSamples = 0;
-unsigned long alignStartTime = 0;
 float gyroZBiasDps = 0.0f;
 bool gyroBiasReady = false;
 
-const float MAG_CORRECTION_GAIN = 0.035f;
+const float MAG_CORRECTION_GAIN_STILL = 0.035f;
+const float MAG_CORRECTION_GAIN_ROTATING = 0.006f;
 const float MAG_HEADING_LPF_ALPHA = 0.12f;
-const float MAG_MAX_CORRECTION_DPS = 90.0f;
-const float OUTPUT_ALIGN_GAIN = 0.008f;
-const float OUTPUT_ALIGN_MAX_DPS = 12.0f;
+const float MAG_MAX_CORRECTION_DPS = 20.0f;
+const float ROTATION_FAST_THRESHOLD_DPS = 25.0f;
 const float MAG_DISTURB_THRESHOLD_FRAC = 0.30f;
-const unsigned long ALIGN_DURATION_MS = 5000;
 const float STATIONARY_ACCEL_TOL = 0.35f;
 const float STATIONARY_GYRO_TOL_DPS = 1.0f;
 const float GYRO_BIAS_ALPHA = 0.02f;
+const float GYRO_RATE_CLAMP_DPS = 250.0f;
 
 float clampf(float value, float minValue, float maxValue)
 {
@@ -328,7 +317,6 @@ void loop()
             magneticReset();
             lastReadTime = currentMillis;
             lastFusionTime = currentMillis;
-            alignStartTime = currentMillis;
             initState = INIT_DONE;
             break;
 
@@ -365,8 +353,6 @@ void loop()
             imu::Vector<3> imuAcc;
             imu::Vector<3> imuGyro;
             bool imuSampleValid = false;
-            float imuHeading = 0.0f;
-            bool imuHeadingTrusted = false;
 
             if (bnoReady)
             {
@@ -374,27 +360,7 @@ void loop()
                 imuMag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
                 imuAcc = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
                 imuGyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
-                imuHeading = wrap360(imuEuler.x());
                 imuSampleValid = true;
-
-                uint8_t sysCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
-                bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
-                imuHeadingTrusted = (sysCal > 0);
-
-                if (!imuContinuityReady)
-                {
-                    if (yawWasRestoredFromNv && yawInitialized)
-                        imuHeadingOffsetDeg = wrap180(fusedYawDeg - imuHeading);
-                    else
-                    {
-                        imuHeadingOffsetDeg = 0.0f;
-                        fusedYawDeg = imuHeading;
-                        yawInitialized = true;
-                    }
-
-                    imuContinuityReady = true;
-                    checkpointPersistentState(currentMillis, true);
-                }
             }
 
             // apply hard/soft iron correction
@@ -406,9 +372,7 @@ void loop()
             heading_mag = wrap360(heading_mag);
 
             float heading_tilt = heading_mag;
-            float heading_fused = heading_mag;
-            float targetAlignOffset = 0.0f;
-            float fusionDt = 0.01f;
+            float heading_fused = yawInitialized ? fusedYawDeg : heading_mag;
 
             if (imuSampleValid)
             {
@@ -442,9 +406,8 @@ void loop()
                 float dt = (currentMillis - lastFusionTime) * 0.001f;
                 lastFusionTime = currentMillis;
                 if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
-                fusionDt = dt;
 
-                float gyroZ_dps = imuGyro.z() * (180.0f / M_PI);
+                float gyroZ_dps = clampf(imuGyro.z(), -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
                 float accelNorm = sqrtf((accelX * accelX) + (accelY * accelY) + (accelZ * accelZ));
                 bool isStationary = (fabsf(accelNorm - 9.81f) < STATIONARY_ACCEL_TOL) &&
                                     (fabsf(gyroZ_dps) < STATIONARY_GYRO_TOL_DPS);
@@ -488,63 +451,26 @@ void loop()
                 {
                     referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
                     float yawError = wrap180(magHeadingFilteredDeg - fusedYawDeg);
-                    float magCorrection = MAG_CORRECTION_GAIN * yawError;
+
+                    float rotationRateDps = fabsf(gyroZCorrected_dps);
+                    float correctionGain = (rotationRateDps > ROTATION_FAST_THRESHOLD_DPS)
+                                               ? MAG_CORRECTION_GAIN_ROTATING
+                                               : MAG_CORRECTION_GAIN_STILL;
+
+                    float magCorrection = correctionGain * yawError;
                     float maxCorrectionStep = MAG_MAX_CORRECTION_DPS * dt;
                     magCorrection = clampf(magCorrection, -maxCorrectionStep, maxCorrectionStep);
                     fusedYawDeg = wrap360(fusedYawDeg + magCorrection);
                 }
 
                 heading_fused = fusedYawDeg;
-
-                if (!outputHeadingReady)
-                {
-                    outputHeadingDeg = heading_fused;
-                    outputHeadingReady = true;
-                }
-
-                if (imuSampleValid)
-                {
-                    if (!lastImuHeadingReady)
-                    {
-                        lastImuHeadingDeg = imuHeading;
-                        lastImuHeadingReady = true;
-                    }
-                    else
-                    {
-                        float imuHeadingDelta = wrap180(imuHeading - lastImuHeadingDeg);
-                        lastImuHeadingDeg = imuHeading;
-                        outputHeadingDeg = wrap360(outputHeadingDeg + imuHeadingDelta);
-                    }
-                }
-
-                float outputAlignError = wrap180(heading_fused - outputHeadingDeg);
-                float outputAlignCorrection = OUTPUT_ALIGN_GAIN * outputAlignError;
-                float maxOutputAlignStep = OUTPUT_ALIGN_MAX_DPS * fusionDt;
-                outputAlignCorrection = clampf(outputAlignCorrection, -maxOutputAlignStep, maxOutputAlignStep);
-                outputHeadingDeg = wrap360(outputHeadingDeg + outputAlignCorrection);
-
-                fusedYawDeg = wrap360(imuHeading + imuHeadingOffsetDeg);
-                heading_fused = fusedYawDeg;
-
-                targetAlignOffset = wrap180(imuEuler.x() - heading_fused);
-                if (!headingAlignReady && !magDisturbed && imuHeadingTrusted)
-                {
-                    headingAlignOffsetAccum += targetAlignOffset;
-                    headingAlignOffsetSamples++;
-
-                    if ((currentMillis - alignStartTime >= ALIGN_DURATION_MS) && (headingAlignOffsetSamples > 0))
-                    {
-                        headingAlignOffsetDeg = headingAlignOffsetAccum / (float)headingAlignOffsetSamples;
-                        headingAlignReady = true;
-                    }
-                }
             }
 
             if (currentMillis - lastPrintTime >= PRINT_INTERVAL)
             {
                 lastPrintTime = currentMillis;
 
-                float heading_output = heading_fused;
+                float heading_output = yawInitialized ? fusedYawDeg : heading_fused;
 
                 Serial.print("BMM350 X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
