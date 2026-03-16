@@ -206,6 +206,7 @@ void loop()
             imu::Vector<3> imuAcc;
             imu::Vector<3> imuGyro;
             bool imuSampleValid = false;
+            float imuHeading = 0.0f;
 
             if (bnoReady)
             {
@@ -213,6 +214,7 @@ void loop()
                 imuMag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
                 imuAcc = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
                 imuGyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+                imuHeading = wrap360(imuEuler.x());
                 imuSampleValid = true;
             }
 
@@ -330,7 +332,12 @@ void loop()
                 Serial.print(" Z:"); Serial.print(z_corrected, 2);
                 Serial.println();
 
-                Serial.print("BMM350 H:"); Serial.println(heading_output, 1);
+                Serial.print("BMM350 H:"); Serial.print(heading_output, 1);
+                Serial.print(" | IMU H:");
+                if (imuSampleValid)
+                    Serial.println(imuHeading, 1);
+                else
+                    Serial.println("NA");
             }
         }
     }
