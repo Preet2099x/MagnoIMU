@@ -62,12 +62,26 @@ const unsigned long PRINT_INTERVAL = 100; // 10 Hz
  const float SOFT_IRON_Y = 0.875f;
  const float SOFT_IRON_Z = 1.926f;
 
-const unsigned long ALIGN_DURATION_MS = 5000;
+unsigned long lastFusionTime = 0;
+bool yawInitialized = false;
+float fusedYawDeg = 0.0f;
+float referenceFieldNorm_uT = 0.0f;
+bool fieldReferenceReady = false;
+bool magDisturbed = false;
+bool headingAlignReady = false;
+float headingAlignOffsetDeg = 0.0f;
+float headingAlignOffsetAccum = 0.0f;
+uint32_t headingAlignOffsetSamples = 0;
 unsigned long alignStartTime = 0;
-bool headingOffsetReady = false;
-float headingOffsetDeg = 0.0f;
-float headingOffsetAccum = 0.0f;
-uint32_t headingOffsetSamples = 0;
+float gyroZBiasDps = 0.0f;
+bool gyroBiasReady = false;
+
+const float MAG_CORRECTION_GAIN = 0.035f;
+const float MAG_DISTURB_THRESHOLD_FRAC = 0.30f;
+const unsigned long ALIGN_DURATION_MS = 5000;
+const float STATIONARY_ACCEL_TOL = 0.35f;
+const float STATIONARY_GYRO_TOL_DPS = 1.0f;
+const float GYRO_BIAS_ALPHA = 0.02f;
 
 float wrap360(float angle)
 {
@@ -154,6 +168,7 @@ void loop()
         case INIT_VERIFY_STATUS:
             magneticReset();
             lastReadTime = currentMillis;
+            lastFusionTime = currentMillis;
             alignStartTime = currentMillis;
             initState = INIT_DONE;
             break;
@@ -186,14 +201,18 @@ void loop()
             float y_uT = y / SENSITIVITY;
             float z_uT = z / SENSITIVITY;
 
-            imu::Vector<3> euler;
             imu::Vector<3> imuMag;
+            imu::Vector<3> imuEuler;
+            imu::Vector<3> imuAcc;
+            imu::Vector<3> imuGyro;
             bool imuSampleValid = false;
 
             if (bnoReady)
             {
-                euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+                imuEuler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
                 imuMag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
+                imuAcc = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
+                imuGyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
                 imuSampleValid = true;
             }
 
@@ -205,42 +224,135 @@ void loop()
             float heading_mag = atan2f(y_corrected, x_corrected) * 180.0f / M_PI;
             heading_mag = wrap360(heading_mag);
 
-            float heading_bmm_aligned = heading_mag;
+            float heading_tilt = heading_mag;
+            float heading_fused = heading_mag;
+            float targetAlignOffset = 0.0f;
 
             if (imuSampleValid)
             {
-                if (!headingOffsetReady)
-                {
-                    float delta = wrap180(euler.x() - heading_mag);
-                    headingOffsetAccum += delta;
-                    headingOffsetSamples++;
-                    headingOffsetDeg = headingOffsetAccum / (float)headingOffsetSamples;
+                float accelX = imuAcc.x();
+                float accelY = imuAcc.y();
+                float accelZ = imuAcc.z();
 
-                    if (currentMillis - alignStartTime >= ALIGN_DURATION_MS)
-                        headingOffsetReady = true;
+                float roll = atan2f(accelY, accelZ);
+                float pitch = atan2f(-accelX, sqrtf(accelY * accelY + accelZ * accelZ));
+
+                float mx = x_corrected;
+                float my = y_corrected;
+                float mz = z_corrected;
+
+                float mxh = (mx * cosf(pitch)) + (mz * sinf(pitch));
+                float myh = (mx * sinf(roll) * sinf(pitch)) + (my * cosf(roll)) - (mz * sinf(roll) * cosf(pitch));
+
+                heading_tilt = wrap360(atan2f(myh, mxh) * 180.0f / M_PI);
+
+                float dt = (currentMillis - lastFusionTime) * 0.001f;
+                lastFusionTime = currentMillis;
+                if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
+
+                float gyroZ_dps = imuGyro.z() * (180.0f / M_PI);
+                float accelNorm = sqrtf((accelX * accelX) + (accelY * accelY) + (accelZ * accelZ));
+                bool isStationary = (fabsf(accelNorm - 9.81f) < STATIONARY_ACCEL_TOL) &&
+                                    (fabsf(gyroZ_dps) < STATIONARY_GYRO_TOL_DPS);
+
+                if (isStationary)
+                {
+                    if (!gyroBiasReady)
+                    {
+                        gyroZBiasDps = gyroZ_dps;
+                        gyroBiasReady = true;
+                    }
+                    else
+                    {
+                        gyroZBiasDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroZBiasDps) + (GYRO_BIAS_ALPHA * gyroZ_dps);
+                    }
                 }
 
-                heading_bmm_aligned = wrap360(heading_mag + headingOffsetDeg);
+                float gyroZCorrected_dps = gyroZ_dps - gyroZBiasDps;
+
+                if (!yawInitialized)
+                {
+                    fusedYawDeg = heading_tilt;
+                    yawInitialized = true;
+                }
+
+                fusedYawDeg = wrap360(fusedYawDeg + gyroZCorrected_dps * dt);
+
+                float fieldNorm = sqrtf((mx * mx) + (my * my) + (mz * mz));
+                if (!fieldReferenceReady)
+                {
+                    referenceFieldNorm_uT = fieldNorm;
+                    fieldReferenceReady = true;
+                }
+
+                float normErrorFrac = fabsf(fieldNorm - referenceFieldNorm_uT) /
+                                      (referenceFieldNorm_uT > 0.001f ? referenceFieldNorm_uT : 1.0f);
+                magDisturbed = normErrorFrac > MAG_DISTURB_THRESHOLD_FRAC;
+
+                if (!magDisturbed)
+                {
+                    referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
+                    float yawError = wrap180(heading_tilt - fusedYawDeg);
+                    fusedYawDeg = wrap360(fusedYawDeg + (MAG_CORRECTION_GAIN * yawError));
+                }
+
+                heading_fused = fusedYawDeg;
+
+                targetAlignOffset = wrap180(imuEuler.x() - heading_fused);
+                if (!headingAlignReady && !magDisturbed)
+                {
+                    headingAlignOffsetAccum += targetAlignOffset;
+                    headingAlignOffsetSamples++;
+
+                    if ((currentMillis - alignStartTime >= ALIGN_DURATION_MS) && (headingAlignOffsetSamples > 0))
+                    {
+                        headingAlignOffsetDeg = headingAlignOffsetAccum / (float)headingAlignOffsetSamples;
+                        headingAlignReady = true;
+                    }
+                }
             }
 
             if (currentMillis - lastPrintTime >= PRINT_INTERVAL)
             {
                 lastPrintTime = currentMillis;
 
-                Serial.print("BMM350 H:"); Serial.print(heading_bmm_aligned, 1);
+                float heading_output = heading_fused;
+                if (imuSampleValid)
+                {
+                    if (headingAlignReady)
+                        heading_output = wrap360(heading_fused + headingAlignOffsetDeg);
+                    else
+                        heading_output = wrap360(heading_fused + targetAlignOffset);
+                }
+
+                Serial.print("BMM350 H:"); Serial.print(heading_output, 1);
                 Serial.print(" X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
                 Serial.print(" Z:"); Serial.print(z_corrected, 2);
 
                 if (imuSampleValid)
                 {
-                    Serial.print(" | BNO055 H:"); Serial.print(euler.x(), 1);
+                    Serial.print(" | BNO055 H:"); Serial.print(imuEuler.x(), 1);
                     Serial.print(" X:"); Serial.print(imuMag.x(), 2);
                     Serial.print(" Y:"); Serial.print(imuMag.y(), 2);
                     Serial.print(" Z:"); Serial.print(imuMag.z(), 2);
                 }
 
                 Serial.println();
+
+                // Print accelerometer and gyroscope data on the next line
+                if (imuSampleValid)
+                {
+                    Serial.print("BNO055 Accel X:"); Serial.print(imuAcc.x(), 3);
+                    Serial.print(" Y:"); Serial.print(imuAcc.y(), 3);
+                    Serial.print(" Z:"); Serial.print(imuAcc.z(), 3);
+
+                    Serial.print(" | Gyro X:"); Serial.print(imuGyro.x(), 3);
+                    Serial.print(" Y:"); Serial.print(imuGyro.y(), 3);
+                    Serial.print(" Z:"); Serial.print(imuGyro.z(), 3);
+
+                    Serial.println();
+                }
             }
         }
     }
