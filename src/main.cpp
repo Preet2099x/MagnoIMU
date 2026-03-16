@@ -19,7 +19,7 @@ bool readReg(uint8_t reg, uint8_t *data, uint8_t len)
 
     uint8_t total = len + 2;
 
-    if (Wire.requestFrom(BMM350_ADDR, total) != total)
+    if (Wire.requestFrom(static_cast<uint8_t>(BMM350_ADDR), static_cast<uint8_t>(total)) != total)
         return false;
 
     Wire.read();
