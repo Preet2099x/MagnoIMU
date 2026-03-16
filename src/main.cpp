@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include <stddef.h>
+#include <EEPROM.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 
@@ -8,6 +10,66 @@
 
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 bool bnoReady = false;
+
+struct PersistedState
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t checksum;
+    float lastYawDeg;
+    uint8_t yawValid;
+    uint8_t bnoOffsetsValid;
+    uint8_t reserved[2];
+    adafruit_bno055_offsets_t bnoOffsets;
+};
+
+const uint32_t PERSIST_MAGIC = 0x4D494D55UL;
+const uint16_t PERSIST_VERSION = 1;
+const int EEPROM_ADDR = 0;
+const unsigned long EEPROM_SAVE_INTERVAL_MS = 2000;
+const float EEPROM_SAVE_MIN_DELTA_DEG = 0.5f;
+
+unsigned long lastEepromSaveMs = 0;
+float lastSavedYawDeg = 0.0f;
+bool savedOffsetsAlready = false;
+
+uint16_t computePersistChecksum(const PersistedState &state)
+{
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&state);
+    uint16_t sum = 0;
+
+    for (size_t i = 0; i < sizeof(PersistedState); i++)
+    {
+        if (i == offsetof(PersistedState, checksum) || i == (offsetof(PersistedState, checksum) + 1))
+            continue;
+        sum = static_cast<uint16_t>(sum + bytes[i]);
+    }
+
+    return sum;
+}
+
+bool persistedStateValid(const PersistedState &state)
+{
+    if (state.magic != PERSIST_MAGIC)
+        return false;
+    if (state.version != PERSIST_VERSION)
+        return false;
+    return state.checksum == computePersistChecksum(state);
+}
+
+bool loadPersistedState(PersistedState &state)
+{
+    EEPROM.get(EEPROM_ADDR, state);
+    return persistedStateValid(state);
+}
+
+void savePersistedState(PersistedState state)
+{
+    state.magic = PERSIST_MAGIC;
+    state.version = PERSIST_VERSION;
+    state.checksum = computePersistChecksum(state);
+    EEPROM.put(EEPROM_ADDR, state);
+}
 
 /* I2C read (2 dummy bytes) */
 bool readReg(uint8_t reg, uint8_t *data, uint8_t len)
@@ -65,6 +127,15 @@ const unsigned long PRINT_INTERVAL = 100; // 10 Hz
 unsigned long lastFusionTime = 0;
 bool yawInitialized = false;
 float fusedYawDeg = 0.0f;
+bool yawWasRestoredFromNv = false;
+bool imuContinuityReady = false;
+float imuHeadingOffsetDeg = 0.0f;
+bool magHeadingFilteredReady = false;
+float magHeadingFilteredDeg = 0.0f;
+bool outputHeadingReady = false;
+float outputHeadingDeg = 0.0f;
+bool lastImuHeadingReady = false;
+float lastImuHeadingDeg = 0.0f;
 float referenceFieldNorm_uT = 0.0f;
 bool fieldReferenceReady = false;
 bool magDisturbed = false;
@@ -77,11 +148,22 @@ float gyroZBiasDps = 0.0f;
 bool gyroBiasReady = false;
 
 const float MAG_CORRECTION_GAIN = 0.035f;
+const float MAG_HEADING_LPF_ALPHA = 0.12f;
+const float MAG_MAX_CORRECTION_DPS = 90.0f;
+const float OUTPUT_ALIGN_GAIN = 0.008f;
+const float OUTPUT_ALIGN_MAX_DPS = 12.0f;
 const float MAG_DISTURB_THRESHOLD_FRAC = 0.30f;
 const unsigned long ALIGN_DURATION_MS = 5000;
 const float STATIONARY_ACCEL_TOL = 0.35f;
 const float STATIONARY_GYRO_TOL_DPS = 1.0f;
 const float GYRO_BIAS_ALPHA = 0.02f;
+
+float clampf(float value, float minValue, float maxValue)
+{
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
 
 float wrap360(float angle)
 {
@@ -95,6 +177,80 @@ float wrap180(float angle)
     while (angle <= -180.0f) angle += 360.0f;
     while (angle > 180.0f) angle -= 360.0f;
     return angle;
+}
+
+void restorePersistentState()
+{
+    PersistedState state;
+    if (!loadPersistedState(state))
+        return;
+
+    if (bnoReady && state.bnoOffsetsValid)
+    {
+        bno.setSensorOffsets(state.bnoOffsets);
+        savedOffsetsAlready = true;
+    }
+
+    if (state.yawValid)
+    {
+        fusedYawDeg = wrap360(state.lastYawDeg);
+        yawInitialized = true;
+        yawWasRestoredFromNv = true;
+        lastSavedYawDeg = fusedYawDeg;
+    }
+}
+
+void checkpointPersistentState(unsigned long nowMs, bool forceSave)
+{
+    if (!forceSave && (nowMs - lastEepromSaveMs) < EEPROM_SAVE_INTERVAL_MS)
+        return;
+
+    PersistedState state = {};
+    bool haveAnythingToSave = false;
+
+    if (yawInitialized)
+    {
+        state.lastYawDeg = wrap360(fusedYawDeg);
+        state.yawValid = 1;
+        haveAnythingToSave = true;
+    }
+
+    if (bnoReady)
+    {
+        adafruit_bno055_offsets_t offsets;
+        if (bno.getSensorOffsets(offsets))
+        {
+            state.bnoOffsets = offsets;
+            state.bnoOffsetsValid = 1;
+            haveAnythingToSave = true;
+        }
+    }
+
+    if (!haveAnythingToSave)
+        return;
+
+    bool shouldSave = forceSave;
+
+    if (state.yawValid)
+    {
+        float yawDeltaDeg = fabsf(wrap180(state.lastYawDeg - lastSavedYawDeg));
+        if (yawDeltaDeg >= EEPROM_SAVE_MIN_DELTA_DEG)
+            shouldSave = true;
+    }
+
+    if (state.bnoOffsetsValid && !savedOffsetsAlready && bnoReady && bno.isFullyCalibrated())
+        shouldSave = true;
+
+    if (!shouldSave)
+        return;
+
+    savePersistedState(state);
+    lastEepromSaveMs = nowMs;
+
+    if (state.yawValid)
+        lastSavedYawDeg = state.lastYawDeg;
+    if (state.bnoOffsetsValid)
+        savedOffsetsAlready = true;
 }
 
 /* ---- Init state machine ---- */
@@ -119,6 +275,9 @@ void setup()
     bnoReady = bno.begin();
     if (bnoReady)
         bno.setExtCrystalUse(true);
+
+    restorePersistentState();
+    lastEepromSaveMs = millis();
 }
 
 void loop()
@@ -207,6 +366,7 @@ void loop()
             imu::Vector<3> imuGyro;
             bool imuSampleValid = false;
             float imuHeading = 0.0f;
+            bool imuHeadingTrusted = false;
 
             if (bnoReady)
             {
@@ -216,6 +376,25 @@ void loop()
                 imuGyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
                 imuHeading = wrap360(imuEuler.x());
                 imuSampleValid = true;
+
+                uint8_t sysCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+                bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
+                imuHeadingTrusted = (sysCal > 0);
+
+                if (!imuContinuityReady)
+                {
+                    if (yawWasRestoredFromNv && yawInitialized)
+                        imuHeadingOffsetDeg = wrap180(fusedYawDeg - imuHeading);
+                    else
+                    {
+                        imuHeadingOffsetDeg = 0.0f;
+                        fusedYawDeg = imuHeading;
+                        yawInitialized = true;
+                    }
+
+                    imuContinuityReady = true;
+                    checkpointPersistentState(currentMillis, true);
+                }
             }
 
             // apply hard/soft iron correction
@@ -229,6 +408,7 @@ void loop()
             float heading_tilt = heading_mag;
             float heading_fused = heading_mag;
             float targetAlignOffset = 0.0f;
+            float fusionDt = 0.01f;
 
             if (imuSampleValid)
             {
@@ -248,9 +428,21 @@ void loop()
 
                 heading_tilt = wrap360(atan2f(myh, mxh) * 180.0f / M_PI);
 
+                if (!magHeadingFilteredReady)
+                {
+                    magHeadingFilteredDeg = heading_tilt;
+                    magHeadingFilteredReady = true;
+                }
+                else
+                {
+                    float magDelta = wrap180(heading_tilt - magHeadingFilteredDeg);
+                    magHeadingFilteredDeg = wrap360(magHeadingFilteredDeg + (MAG_HEADING_LPF_ALPHA * magDelta));
+                }
+
                 float dt = (currentMillis - lastFusionTime) * 0.001f;
                 lastFusionTime = currentMillis;
                 if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
+                fusionDt = dt;
 
                 float gyroZ_dps = imuGyro.z() * (180.0f / M_PI);
                 float accelNorm = sqrtf((accelX * accelX) + (accelY * accelY) + (accelZ * accelZ));
@@ -276,6 +468,7 @@ void loop()
                 {
                     fusedYawDeg = heading_tilt;
                     yawInitialized = true;
+                    checkpointPersistentState(currentMillis, true);
                 }
 
                 fusedYawDeg = wrap360(fusedYawDeg + gyroZCorrected_dps * dt);
@@ -294,14 +487,47 @@ void loop()
                 if (!magDisturbed)
                 {
                     referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
-                    float yawError = wrap180(heading_tilt - fusedYawDeg);
-                    fusedYawDeg = wrap360(fusedYawDeg + (MAG_CORRECTION_GAIN * yawError));
+                    float yawError = wrap180(magHeadingFilteredDeg - fusedYawDeg);
+                    float magCorrection = MAG_CORRECTION_GAIN * yawError;
+                    float maxCorrectionStep = MAG_MAX_CORRECTION_DPS * dt;
+                    magCorrection = clampf(magCorrection, -maxCorrectionStep, maxCorrectionStep);
+                    fusedYawDeg = wrap360(fusedYawDeg + magCorrection);
                 }
 
                 heading_fused = fusedYawDeg;
 
+                if (!outputHeadingReady)
+                {
+                    outputHeadingDeg = heading_fused;
+                    outputHeadingReady = true;
+                }
+
+                if (imuSampleValid)
+                {
+                    if (!lastImuHeadingReady)
+                    {
+                        lastImuHeadingDeg = imuHeading;
+                        lastImuHeadingReady = true;
+                    }
+                    else
+                    {
+                        float imuHeadingDelta = wrap180(imuHeading - lastImuHeadingDeg);
+                        lastImuHeadingDeg = imuHeading;
+                        outputHeadingDeg = wrap360(outputHeadingDeg + imuHeadingDelta);
+                    }
+                }
+
+                float outputAlignError = wrap180(heading_fused - outputHeadingDeg);
+                float outputAlignCorrection = OUTPUT_ALIGN_GAIN * outputAlignError;
+                float maxOutputAlignStep = OUTPUT_ALIGN_MAX_DPS * fusionDt;
+                outputAlignCorrection = clampf(outputAlignCorrection, -maxOutputAlignStep, maxOutputAlignStep);
+                outputHeadingDeg = wrap360(outputHeadingDeg + outputAlignCorrection);
+
+                fusedYawDeg = wrap360(imuHeading + imuHeadingOffsetDeg);
+                heading_fused = fusedYawDeg;
+
                 targetAlignOffset = wrap180(imuEuler.x() - heading_fused);
-                if (!headingAlignReady && !magDisturbed)
+                if (!headingAlignReady && !magDisturbed && imuHeadingTrusted)
                 {
                     headingAlignOffsetAccum += targetAlignOffset;
                     headingAlignOffsetSamples++;
@@ -319,26 +545,16 @@ void loop()
                 lastPrintTime = currentMillis;
 
                 float heading_output = heading_fused;
-                if (imuSampleValid)
-                {
-                    if (headingAlignReady)
-                        heading_output = wrap360(heading_fused + headingAlignOffsetDeg);
-                    else
-                        heading_output = wrap360(heading_fused + targetAlignOffset);
-                }
 
                 Serial.print("BMM350 X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
                 Serial.print(" Z:"); Serial.print(z_corrected, 2);
                 Serial.println();
 
-                Serial.print("BMM350 H:"); Serial.print(heading_output, 1);
-                Serial.print(" | IMU H:");
-                if (imuSampleValid)
-                    Serial.println(imuHeading, 1);
-                else
-                    Serial.println("NA");
+                Serial.print("BMM350 H:"); Serial.println(heading_output, 1);
             }
         }
     }
+
+    checkpointPersistentState(currentMillis, false);
 }
