@@ -325,34 +325,12 @@ void loop()
                         heading_output = wrap360(heading_fused + targetAlignOffset);
                 }
 
-                Serial.print("BMM350 H:"); Serial.print(heading_output, 1);
-                Serial.print(" X:"); Serial.print(x_corrected, 2);
+                Serial.print("BMM350 X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
                 Serial.print(" Z:"); Serial.print(z_corrected, 2);
-
-                if (imuSampleValid)
-                {
-                    Serial.print(" | BNO055 H:"); Serial.print(imuEuler.x(), 1);
-                    Serial.print(" X:"); Serial.print(imuMag.x(), 2);
-                    Serial.print(" Y:"); Serial.print(imuMag.y(), 2);
-                    Serial.print(" Z:"); Serial.print(imuMag.z(), 2);
-                }
-
                 Serial.println();
 
-                // Print accelerometer and gyroscope data on the next line
-                if (imuSampleValid)
-                {
-                    Serial.print("BNO055 Accel X:"); Serial.print(imuAcc.x(), 3);
-                    Serial.print(" Y:"); Serial.print(imuAcc.y(), 3);
-                    Serial.print(" Z:"); Serial.print(imuAcc.z(), 3);
-
-                    Serial.print(" | Gyro X:"); Serial.print(imuGyro.x(), 3);
-                    Serial.print(" Y:"); Serial.print(imuGyro.y(), 3);
-                    Serial.print(" Z:"); Serial.print(imuGyro.z(), 3);
-
-                    Serial.println();
-                }
+                Serial.print("BMM350 H:"); Serial.println(heading_output, 1);
             }
         }
     }
