@@ -130,22 +130,23 @@ float fusedYawDeg = 0.0f;
 bool yawWasRestoredFromNv = false;
 bool magHeadingFilteredReady = false;
 float magHeadingFilteredDeg = 0.0f;
+bool outputHeadingReady = false;
+float outputHeadingDeg = 0.0f;
+bool lastImuHeadingReady = false;
+float lastImuHeadingDeg = 0.0f;
 float referenceFieldNorm_uT = 0.0f;
 bool fieldReferenceReady = false;
 bool magDisturbed = false;
 float gyroZBiasDps = 0.0f;
 bool gyroBiasReady = false;
 
-const float MAG_CORRECTION_GAIN_STILL = 0.035f;
-const float MAG_CORRECTION_GAIN_ROTATING = 0.006f;
+const float MAG_CORRECTION_GAIN = 0.035f;
 const float MAG_HEADING_LPF_ALPHA = 0.12f;
-const float MAG_MAX_CORRECTION_DPS = 20.0f;
-const float ROTATION_FAST_THRESHOLD_DPS = 25.0f;
+const float MAG_MAX_CORRECTION_DPS = 90.0f;
 const float MAG_DISTURB_THRESHOLD_FRAC = 0.30f;
 const float STATIONARY_ACCEL_TOL = 0.35f;
 const float STATIONARY_GYRO_TOL_DPS = 1.0f;
 const float GYRO_BIAS_ALPHA = 0.02f;
-const float GYRO_RATE_CLAMP_DPS = 250.0f;
 
 float clampf(float value, float minValue, float maxValue)
 {
@@ -348,21 +349,19 @@ void loop()
             float y_uT = y / SENSITIVITY;
             float z_uT = z / SENSITIVITY;
 
-            imu::Vector<3> imuMag;
-            imu::Vector<3> imuEuler;
             imu::Vector<3> imuAcc;
             imu::Vector<3> imuGyro;
             bool imuSampleValid = false;
 
             if (bnoReady)
             {
-                imuEuler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-                imuMag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
                 imuAcc = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
                 imuGyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
                 imuSampleValid = true;
-            }
 
+                uint8_t sysCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+                bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
+            }
             // apply hard/soft iron correction
             float x_corrected = (x_uT - HARD_IRON_X) * SOFT_IRON_X;
             float y_corrected = (y_uT - HARD_IRON_Y) * SOFT_IRON_Y;
@@ -372,7 +371,7 @@ void loop()
             heading_mag = wrap360(heading_mag);
 
             float heading_tilt = heading_mag;
-            float heading_fused = yawInitialized ? fusedYawDeg : heading_mag;
+            float heading_fused = heading_mag;
 
             if (imuSampleValid)
             {
@@ -407,7 +406,8 @@ void loop()
                 lastFusionTime = currentMillis;
                 if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
 
-                float gyroZ_dps = clampf(imuGyro.z(), -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
+                // BNO055 VECTOR_GYROSCOPE natively provides degrees per second
+                float gyroZ_dps = imuGyro.z();
                 float accelNorm = sqrtf((accelX * accelX) + (accelY * accelY) + (accelZ * accelZ));
                 bool isStationary = (fabsf(accelNorm - 9.81f) < STATIONARY_ACCEL_TOL) &&
                                     (fabsf(gyroZ_dps) < STATIONARY_GYRO_TOL_DPS);
@@ -451,13 +451,7 @@ void loop()
                 {
                     referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
                     float yawError = wrap180(magHeadingFilteredDeg - fusedYawDeg);
-
-                    float rotationRateDps = fabsf(gyroZCorrected_dps);
-                    float correctionGain = (rotationRateDps > ROTATION_FAST_THRESHOLD_DPS)
-                                               ? MAG_CORRECTION_GAIN_ROTATING
-                                               : MAG_CORRECTION_GAIN_STILL;
-
-                    float magCorrection = correctionGain * yawError;
+                    float magCorrection = MAG_CORRECTION_GAIN * yawError;
                     float maxCorrectionStep = MAG_MAX_CORRECTION_DPS * dt;
                     magCorrection = clampf(magCorrection, -maxCorrectionStep, maxCorrectionStep);
                     fusedYawDeg = wrap360(fusedYawDeg + magCorrection);
@@ -470,7 +464,7 @@ void loop()
             {
                 lastPrintTime = currentMillis;
 
-                float heading_output = yawInitialized ? fusedYawDeg : heading_fused;
+                float heading_output = heading_fused;
 
                 Serial.print("BMM350 X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
@@ -484,3 +478,7 @@ void loop()
 
     checkpointPersistentState(currentMillis, false);
 }
+
+
+
+
