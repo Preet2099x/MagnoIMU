@@ -2,7 +2,6 @@
 #include <Wire.h>
 #include <math.h>
 #include <stddef.h>
-#include <EEPROM.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 
@@ -10,66 +9,6 @@
 
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 bool bnoReady = false;
-
-struct PersistedState
-{
-    uint32_t magic;
-    uint16_t version;
-    uint16_t checksum;
-    float lastYawDeg;
-    uint8_t yawValid;
-    uint8_t bnoOffsetsValid;
-    uint8_t reserved[2];
-    adafruit_bno055_offsets_t bnoOffsets;
-};
-
-const uint32_t PERSIST_MAGIC = 0x4D494D55UL;
-const uint16_t PERSIST_VERSION = 1;
-const int EEPROM_ADDR = 0;
-const unsigned long EEPROM_SAVE_INTERVAL_MS = 2000;
-const float EEPROM_SAVE_MIN_DELTA_DEG = 0.5f;
-
-unsigned long lastEepromSaveMs = 0;
-float lastSavedYawDeg = 0.0f;
-bool savedOffsetsAlready = false;
-
-uint16_t computePersistChecksum(const PersistedState &state)
-{
-    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&state);
-    uint16_t sum = 0;
-
-    for (size_t i = 0; i < sizeof(PersistedState); i++)
-    {
-        if (i == offsetof(PersistedState, checksum) || i == (offsetof(PersistedState, checksum) + 1))
-            continue;
-        sum = static_cast<uint16_t>(sum + bytes[i]);
-    }
-
-    return sum;
-}
-
-bool persistedStateValid(const PersistedState &state)
-{
-    if (state.magic != PERSIST_MAGIC)
-        return false;
-    if (state.version != PERSIST_VERSION)
-        return false;
-    return state.checksum == computePersistChecksum(state);
-}
-
-bool loadPersistedState(PersistedState &state)
-{
-    EEPROM.get(EEPROM_ADDR, state);
-    return persistedStateValid(state);
-}
-
-void savePersistedState(PersistedState state)
-{
-    state.magic = PERSIST_MAGIC;
-    state.version = PERSIST_VERSION;
-    state.checksum = computePersistChecksum(state);
-    EEPROM.put(EEPROM_ADDR, state);
-}
 
 /* I2C read (2 dummy bytes) */
 bool readReg(uint8_t reg, uint8_t *data, uint8_t len)
@@ -124,10 +63,17 @@ const unsigned long PRINT_INTERVAL = 100; // 10 Hz
  const float SOFT_IRON_Y = 0.875f;
  const float SOFT_IRON_Z = 1.926f;
 
+ // Magnetic Declination offsets the global variation in the Earth's magnetic field by Lat/Lon.
+ // Find your local declination at: http://www.magnetic-declination.com/
+ // East is positive (+), West is negative (-)
+ const float MAGNETIC_DECLINATION = -0.1833f; // Jamshedpur: -0° 11' (Declination is NEGATIVE WEST)
+
+ // Optional: Set a specific orientation offset (in degrees) to treat as "0" after True North is found.
+ const float CUSTOM_HEADING_OFFSET = 0.0f; 
+
 unsigned long lastFusionTime = 0;
 bool yawInitialized = false;
 float fusedYawDeg = 0.0f;
-bool yawWasRestoredFromNv = false;
 bool magHeadingFilteredReady = false;
 float magHeadingFilteredDeg = 0.0f;
 bool outputHeadingReady = false;
@@ -169,80 +115,6 @@ float wrap180(float angle)
     return angle;
 }
 
-void restorePersistentState()
-{
-    PersistedState state;
-    if (!loadPersistedState(state))
-        return;
-
-    if (bnoReady && state.bnoOffsetsValid)
-    {
-        bno.setSensorOffsets(state.bnoOffsets);
-        savedOffsetsAlready = true;
-    }
-
-    if (state.yawValid)
-    {
-        fusedYawDeg = wrap360(state.lastYawDeg);
-        yawInitialized = true;
-        yawWasRestoredFromNv = true;
-        lastSavedYawDeg = fusedYawDeg;
-    }
-}
-
-void checkpointPersistentState(unsigned long nowMs, bool forceSave)
-{
-    if (!forceSave && (nowMs - lastEepromSaveMs) < EEPROM_SAVE_INTERVAL_MS)
-        return;
-
-    PersistedState state = {};
-    bool haveAnythingToSave = false;
-
-    if (yawInitialized)
-    {
-        state.lastYawDeg = wrap360(fusedYawDeg);
-        state.yawValid = 1;
-        haveAnythingToSave = true;
-    }
-
-    if (bnoReady)
-    {
-        adafruit_bno055_offsets_t offsets;
-        if (bno.getSensorOffsets(offsets))
-        {
-            state.bnoOffsets = offsets;
-            state.bnoOffsetsValid = 1;
-            haveAnythingToSave = true;
-        }
-    }
-
-    if (!haveAnythingToSave)
-        return;
-
-    bool shouldSave = forceSave;
-
-    if (state.yawValid)
-    {
-        float yawDeltaDeg = fabsf(wrap180(state.lastYawDeg - lastSavedYawDeg));
-        if (yawDeltaDeg >= EEPROM_SAVE_MIN_DELTA_DEG)
-            shouldSave = true;
-    }
-
-    if (state.bnoOffsetsValid && !savedOffsetsAlready && bnoReady && bno.isFullyCalibrated())
-        shouldSave = true;
-
-    if (!shouldSave)
-        return;
-
-    savePersistedState(state);
-    lastEepromSaveMs = nowMs;
-
-    if (state.yawValid)
-        lastSavedYawDeg = state.lastYawDeg;
-    if (state.bnoOffsetsValid)
-        savedOffsetsAlready = true;
-}
-
 /* ---- Init state machine ---- */
 enum InitState {
     INIT_WIRE_BEGIN,
@@ -266,8 +138,7 @@ void setup()
     if (bnoReady)
         bno.setExtCrystalUse(true);
 
-    restorePersistentState();
-    lastEepromSaveMs = millis();
+    Serial.println("Starting!");
 }
 
 void loop()
@@ -367,8 +238,9 @@ void loop()
             float y_corrected = (y_uT - HARD_IRON_Y) * SOFT_IRON_Y;
             float z_corrected = (z_uT - HARD_IRON_Z) * SOFT_IRON_Z;
 
-            float heading_mag = atan2f(y_corrected, x_corrected) * 180.0f / M_PI;
-            heading_mag = wrap360(heading_mag);
+            // Raw magnetic heading adjusted for localized declination map offset
+            float heading_mag = (atan2f(y_corrected, x_corrected) * 180.0f / M_PI) + MAGNETIC_DECLINATION;
+            heading_mag = wrap360(heading_mag - CUSTOM_HEADING_OFFSET);
 
             float heading_tilt = heading_mag;
             float heading_fused = heading_mag;
@@ -389,7 +261,8 @@ void loop()
                 float mxh = (mx * cosf(pitch)) + (mz * sinf(pitch));
                 float myh = (mx * sinf(roll) * sinf(pitch)) + (my * cosf(roll)) - (mz * sinf(roll) * cosf(pitch));
 
-                heading_tilt = wrap360(atan2f(myh, mxh) * 180.0f / M_PI);
+                heading_tilt = (atan2f(myh, mxh) * 180.0f / M_PI) + MAGNETIC_DECLINATION;
+                heading_tilt = wrap360(heading_tilt - CUSTOM_HEADING_OFFSET);
 
                 if (!magHeadingFilteredReady)
                 {
@@ -431,7 +304,6 @@ void loop()
                 {
                     fusedYawDeg = heading_tilt;
                     yawInitialized = true;
-                    checkpointPersistentState(currentMillis, true);
                 }
 
                 fusedYawDeg = wrap360(fusedYawDeg + gyroZCorrected_dps * dt);
@@ -475,8 +347,6 @@ void loop()
             }
         }
     }
-
-    checkpointPersistentState(currentMillis, false);
 }
 
 
