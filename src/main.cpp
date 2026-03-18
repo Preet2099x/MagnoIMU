@@ -2,18 +2,39 @@
 #include <Wire.h>
 #include <math.h>
 #include <stddef.h>
+#include <string.h>
 #include <EEPROM.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BNO055.h>
 
 #define BMM350_ADDR 0x14
 #define BNO055_ADDR 0x28
 
+#define BNO055_CHIP_ID_ADDR 0x00
+#define BNO055_PAGE_ID_ADDR 0x07
 #define BNO055_ACCEL_DATA_X_LSB_ADDR 0x08
 #define BNO055_GYRO_DATA_X_LSB_ADDR 0x14
+#define BNO055_CALIB_STAT_ADDR 0x35
+#define BNO055_UNIT_SEL_ADDR 0x3B
+#define BNO055_OPR_MODE_ADDR 0x3D
+#define BNO055_PWR_MODE_ADDR 0x3E
+#define BNO055_SYS_TRIGGER_ADDR 0x3F
+#define BNO055_ACC_OFFSET_X_LSB_ADDR 0x55
 
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+#define BNO055_CHIP_ID 0xA0
+#define BNO055_OPERATION_MODE_CONFIG 0x00
+#define BNO055_OPERATION_MODE_NDOF 0x0C
+#define BNO055_POWER_MODE_NORMAL 0x00
+#define BNO055_OFFSETS_LEN 22
+
 bool bnoReady = false;
+uint8_t bnoMode = BNO055_OPERATION_MODE_CONFIG;
+
+bool writeBnoReg(uint8_t reg, uint8_t value)
+{
+    Wire.beginTransmission(BNO055_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    return (Wire.endTransmission() == 0);
+}
 
 bool readBnoReg(uint8_t reg, uint8_t *data, uint8_t len)
 {
@@ -29,6 +50,125 @@ bool readBnoReg(uint8_t reg, uint8_t *data, uint8_t len)
         data[i] = Wire.read();
 
     return true;
+}
+
+bool setBnoOperationMode(uint8_t mode)
+{
+    if (!writeBnoReg(BNO055_OPR_MODE_ADDR, mode))
+        return false;
+    bnoMode = mode;
+    delay(30);
+    return true;
+}
+
+bool bnoSetExtCrystalUse(bool useExternalCrystal)
+{
+    uint8_t modeToRestore = bnoMode;
+    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
+        return false;
+
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+        return false;
+
+    if (!writeBnoReg(BNO055_SYS_TRIGGER_ADDR, useExternalCrystal ? 0x80 : 0x00))
+        return false;
+
+    delay(10);
+    return setBnoOperationMode(modeToRestore);
+}
+
+bool bnoBegin()
+{
+    uint8_t chipId = 0;
+    if (!readBnoReg(BNO055_CHIP_ID_ADDR, &chipId, 1) || chipId != BNO055_CHIP_ID)
+    {
+        delay(650);
+        if (!readBnoReg(BNO055_CHIP_ID_ADDR, &chipId, 1) || chipId != BNO055_CHIP_ID)
+            return false;
+    }
+
+    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
+        return false;
+
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+        return false;
+
+    if (!writeBnoReg(BNO055_SYS_TRIGGER_ADDR, 0x20))
+        return false;
+
+    delay(650);
+
+    if (!readBnoReg(BNO055_CHIP_ID_ADDR, &chipId, 1) || chipId != BNO055_CHIP_ID)
+        return false;
+
+    if (!writeBnoReg(BNO055_PWR_MODE_ADDR, BNO055_POWER_MODE_NORMAL))
+        return false;
+
+    delay(10);
+
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+        return false;
+
+    if (!writeBnoReg(BNO055_UNIT_SEL_ADDR, 0x00))
+        return false;
+
+    if (!writeBnoReg(BNO055_SYS_TRIGGER_ADDR, 0x00))
+        return false;
+
+    delay(10);
+
+    if (!setBnoOperationMode(BNO055_OPERATION_MODE_NDOF))
+        return false;
+
+    return true;
+}
+
+bool bnoGetSensorOffsets(uint8_t *offsets)
+{
+    uint8_t modeToRestore = bnoMode;
+    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
+        return false;
+
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+        return false;
+
+    bool ok = readBnoReg(BNO055_ACC_OFFSET_X_LSB_ADDR, offsets, BNO055_OFFSETS_LEN);
+    if (!setBnoOperationMode(modeToRestore))
+        return false;
+
+    return ok;
+}
+
+bool bnoSetSensorOffsets(const uint8_t *offsets)
+{
+    uint8_t modeToRestore = bnoMode;
+    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
+        return false;
+
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+        return false;
+
+    for (uint8_t i = 0; i < BNO055_OFFSETS_LEN; i++)
+    {
+        if (!writeBnoReg(static_cast<uint8_t>(BNO055_ACC_OFFSET_X_LSB_ADDR + i), offsets[i]))
+            return false;
+    }
+
+    return setBnoOperationMode(modeToRestore);
+}
+
+bool bnoIsFullyCalibrated()
+{
+    uint8_t calib = 0;
+    if (!readBnoReg(BNO055_CALIB_STAT_ADDR, &calib, 1))
+        return false;
+
+    uint8_t sys = (calib >> 6) & 0x03;
+    uint8_t gyro = (calib >> 4) & 0x03;
+    uint8_t accel = (calib >> 2) & 0x03;
+    uint8_t mag = calib & 0x03;
+
+    return (sys == 3) && (gyro == 3) && (accel == 3) && (mag == 3);
 }
 
 int16_t decodeBnoInt16(uint8_t lsb, uint8_t msb)
@@ -79,7 +219,7 @@ struct PersistedState
     uint8_t yawValid;
     uint8_t bnoOffsetsValid;
     uint8_t reserved[2];
-    adafruit_bno055_offsets_t bnoOffsets;
+    uint8_t bnoOffsets[BNO055_OFFSETS_LEN];
 };
 
 const uint32_t PERSIST_MAGIC = 0x4D494D55UL;
@@ -235,8 +375,8 @@ void restorePersistentState()
 
     if (bnoReady && state.bnoOffsetsValid)
     {
-        bno.setSensorOffsets(state.bnoOffsets);
-        savedOffsetsAlready = true;
+        if (bnoSetSensorOffsets(state.bnoOffsets))
+            savedOffsetsAlready = true;
     }
 
     if (state.yawValid)
@@ -265,10 +405,10 @@ void checkpointPersistentState(unsigned long nowMs, bool forceSave)
 
     if (bnoReady)
     {
-        adafruit_bno055_offsets_t offsets;
-        if (bno.getSensorOffsets(offsets))
+        uint8_t offsets[BNO055_OFFSETS_LEN];
+        if (bnoGetSensorOffsets(offsets))
         {
-            state.bnoOffsets = offsets;
+            memcpy(state.bnoOffsets, offsets, BNO055_OFFSETS_LEN);
             state.bnoOffsetsValid = 1;
             haveAnythingToSave = true;
         }
@@ -286,7 +426,7 @@ void checkpointPersistentState(unsigned long nowMs, bool forceSave)
             shouldSave = true;
     }
 
-    if (state.bnoOffsetsValid && !savedOffsetsAlready && bnoReady && bno.isFullyCalibrated())
+    if (state.bnoOffsetsValid && !savedOffsetsAlready && bnoReady && bnoIsFullyCalibrated())
         shouldSave = true;
 
     if (!shouldSave)
@@ -320,9 +460,11 @@ void setup()
 {
     Serial.begin(115200);
 
-    bnoReady = bno.begin();
+    Wire.begin();
+
+    bnoReady = bnoBegin();
     if (bnoReady)
-        bno.setExtCrystalUse(true);
+        bnoSetExtCrystalUse(true);
 
     restorePersistentState();
     lastEepromSaveMs = millis();
