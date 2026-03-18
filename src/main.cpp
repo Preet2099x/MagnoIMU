@@ -5,12 +5,11 @@
 #include <string.h>
 #include <EEPROM.h>
 
-#define BMM350_ADDR 0x14
 #define BNO055_ADDR 0x28
-
 #define BNO055_CHIP_ID_ADDR 0x00
 #define BNO055_PAGE_ID_ADDR 0x07
 #define BNO055_ACCEL_DATA_X_LSB_ADDR 0x08
+#define BNO055_MAG_DATA_X_LSB_ADDR 0x0E
 #define BNO055_GYRO_DATA_X_LSB_ADDR 0x14
 #define BNO055_CALIB_STAT_ADDR 0x35
 #define BNO055_UNIT_SEL_ADDR 0x3B
@@ -210,6 +209,26 @@ bool readBnoRawAccelGyro(float &accelX_mps2,
     return true;
 }
 
+bool readBnoRawMag(float &magX_uT,
+                   float &magY_uT,
+                   float &magZ_uT)
+{
+    uint8_t magRaw[6];
+
+    if (!readBnoReg(BNO055_MAG_DATA_X_LSB_ADDR, magRaw, sizeof(magRaw)))
+        return false;
+
+    int16_t magX = decodeBnoInt16(magRaw[0], magRaw[1]);
+    int16_t magY = decodeBnoInt16(magRaw[2], magRaw[3]);
+    int16_t magZ = decodeBnoInt16(magRaw[4], magRaw[5]);
+
+    magX_uT = static_cast<float>(magX) / 16.0f;
+    magY_uT = static_cast<float>(magY) / 16.0f;
+    magZ_uT = static_cast<float>(magZ) / 16.0f;
+
+    return true;
+}
+
 struct PersistedState
 {
     uint32_t magic;
@@ -268,44 +287,6 @@ void savePersistedState(PersistedState state)
     state.version = PERSIST_VERSION;
     state.checksum = computePersistChecksum(state);
     EEPROM.put(EEPROM_ADDR, state);
-}
-
-/* I2C read (2 dummy bytes) */
-bool readReg(uint8_t reg, uint8_t *data, uint8_t len)
-{
-    Wire.beginTransmission(BMM350_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0)
-        return false;
-
-    uint8_t total = len + 2;
-
-    if (Wire.requestFrom(static_cast<uint8_t>(BMM350_ADDR), static_cast<uint8_t>(total)) != total)
-        return false;
-
-    Wire.read();
-    Wire.read();
-
-    for (uint8_t i = 0; i < len; i++)
-        data[i] = Wire.read();
-
-    return true;
-}
-
-/* I2C write */
-bool writeReg(uint8_t reg, uint8_t value)
-{
-    Wire.beginTransmission(BMM350_ADDR);
-    Wire.write(reg);
-    Wire.write(value);
-    return (Wire.endTransmission() == 0);
-}
-
-/* ---- Magnetic Reset ---- */
-void magneticReset()
-{
-    writeReg(0x06, 0x07);
-    delay(20);
 }
 
 /* ---- Timing control ---- */
@@ -441,21 +422,6 @@ void checkpointPersistentState(unsigned long nowMs, bool forceSave)
         savedOffsetsAlready = true;
 }
 
-/* ---- Init state machine ---- */
-enum InitState {
-    INIT_WIRE_BEGIN,
-    INIT_WAIT_WIRE,
-    INIT_SOFT_RESET,
-    INIT_WAIT_RESET,
-    INIT_SET_NORMAL,
-    INIT_WAIT_NORMAL,
-    INIT_VERIFY_STATUS,
-    INIT_DONE
-};
-
-InitState initState = INIT_WIRE_BEGIN;
-unsigned long initTimer = 0;
-
 void setup()
 {
     Serial.begin(115200);
@@ -474,81 +440,20 @@ void loop()
 {
     unsigned long currentMillis = millis();
 
-    if (initState != INIT_DONE)
-    {
-        switch (initState)
-        {
-        case INIT_WIRE_BEGIN:
-            Wire.begin();
-            initTimer = currentMillis;
-            initState = INIT_WAIT_WIRE;
-            break;
-
-        case INIT_WAIT_WIRE:
-            if (currentMillis - initTimer >= 100)
-            {
-                initState = INIT_SOFT_RESET;
-            }
-            break;
-
-        case INIT_SOFT_RESET:
-            writeReg(0x7E, 0xB6);
-            initTimer = currentMillis;
-            initState = INIT_WAIT_RESET;
-            break;
-
-        case INIT_WAIT_RESET:
-            if (currentMillis - initTimer >= 50)
-                initState = INIT_SET_NORMAL;
-            break;
-
-        case INIT_SET_NORMAL:
-            writeReg(0x06, 0x01);
-            writeReg(0x04, 0x04);
-            initTimer = currentMillis;
-            initState = INIT_WAIT_NORMAL;
-            break;
-
-        case INIT_WAIT_NORMAL:
-            if (currentMillis - initTimer >= 10)
-                initState = INIT_VERIFY_STATUS;
-            break;
-
-        case INIT_VERIFY_STATUS:
-            magneticReset();
-            lastReadTime = currentMillis;
-            lastFusionTime = currentMillis;
-            initState = INIT_DONE;
-            break;
-
-        default:
-            break;
-        }
-        return;
-    }
-
     if (currentMillis - lastReadTime >= READ_INTERVAL)
     {
         lastReadTime = currentMillis;
 
-        uint8_t raw[9];
+        float x_uT = 0.0f;
+        float y_uT = 0.0f;
+        float z_uT = 0.0f;
+        bool magSampleValid = false;
 
-        if (readReg(0x31, raw, 9))
+        if (bnoReady)
+            magSampleValid = readBnoRawMag(x_uT, y_uT, z_uT);
+
+        if (magSampleValid)
         {
-            int32_t x = (int32_t)((raw[2] << 16) | (raw[1] << 8) | raw[0]);
-            int32_t y = (int32_t)((raw[5] << 16) | (raw[4] << 8) | raw[3]);
-            int32_t z = (int32_t)((raw[8] << 16) | (raw[7] << 8) | raw[6]);
-
-            if (x & 0x800000) x |= 0xFF000000;
-            if (y & 0x800000) y |= 0xFF000000;
-            if (z & 0x800000) z |= 0xFF000000;
-
-            const float SENSITIVITY = 300.0f;
-
-            float x_uT = x / SENSITIVITY;
-            float y_uT = y / SENSITIVITY;
-            float z_uT = z / SENSITIVITY;
-
             bool imuSampleValid = false;
             float accelX = 0.0f;
             float accelY = 0.0f;
@@ -672,12 +577,12 @@ void loop()
 
                 float heading_output = yawInitialized ? fusedYawDeg : heading_fused;
 
-                Serial.print("BMM350 X:"); Serial.print(x_corrected, 2);
+                Serial.print("BNO055 X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
                 Serial.print(" Z:"); Serial.print(z_corrected, 2);
                 Serial.println();
 
-                Serial.print("BMM350 H:"); Serial.println(heading_output, 1);
+                Serial.print("BNO055 H:"); Serial.println(heading_output, 1);
             }
         }
     }
