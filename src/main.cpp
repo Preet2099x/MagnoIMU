@@ -7,9 +7,68 @@
 #include <Adafruit_BNO055.h>
 
 #define BMM350_ADDR 0x14
+#define BNO055_ADDR 0x28
+
+#define BNO055_ACCEL_DATA_X_LSB_ADDR 0x08
+#define BNO055_GYRO_DATA_X_LSB_ADDR 0x14
 
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 bool bnoReady = false;
+
+bool readBnoReg(uint8_t reg, uint8_t *data, uint8_t len)
+{
+    Wire.beginTransmission(BNO055_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0)
+        return false;
+
+    if (Wire.requestFrom(static_cast<uint8_t>(BNO055_ADDR), len) != len)
+        return false;
+
+    for (uint8_t i = 0; i < len; i++)
+        data[i] = Wire.read();
+
+    return true;
+}
+
+int16_t decodeBnoInt16(uint8_t lsb, uint8_t msb)
+{
+    return static_cast<int16_t>((static_cast<int16_t>(msb) << 8) | lsb);
+}
+
+bool readBnoRawAccelGyro(float &accelX_mps2,
+                         float &accelY_mps2,
+                         float &accelZ_mps2,
+                         float &gyroX_dps,
+                         float &gyroY_dps,
+                         float &gyroZ_dps)
+{
+    uint8_t accelRaw[6];
+    uint8_t gyroRaw[6];
+
+    if (!readBnoReg(BNO055_ACCEL_DATA_X_LSB_ADDR, accelRaw, sizeof(accelRaw)))
+        return false;
+    if (!readBnoReg(BNO055_GYRO_DATA_X_LSB_ADDR, gyroRaw, sizeof(gyroRaw)))
+        return false;
+
+    int16_t accX = decodeBnoInt16(accelRaw[0], accelRaw[1]);
+    int16_t accY = decodeBnoInt16(accelRaw[2], accelRaw[3]);
+    int16_t accZ = decodeBnoInt16(accelRaw[4], accelRaw[5]);
+
+    int16_t gyrX = decodeBnoInt16(gyroRaw[0], gyroRaw[1]);
+    int16_t gyrY = decodeBnoInt16(gyroRaw[2], gyroRaw[3]);
+    int16_t gyrZ = decodeBnoInt16(gyroRaw[4], gyroRaw[5]);
+
+    accelX_mps2 = static_cast<float>(accX) / 100.0f;
+    accelY_mps2 = static_cast<float>(accY) / 100.0f;
+    accelZ_mps2 = static_cast<float>(accZ) / 100.0f;
+
+    gyroX_dps = static_cast<float>(gyrX) / 16.0f;
+    gyroY_dps = static_cast<float>(gyrY) / 16.0f;
+    gyroZ_dps = static_cast<float>(gyrZ) / 16.0f;
+
+    return true;
+}
 
 struct PersistedState
 {
@@ -348,19 +407,22 @@ void loop()
             float y_uT = y / SENSITIVITY;
             float z_uT = z / SENSITIVITY;
 
-            imu::Vector<3> imuMag;
-            imu::Vector<3> imuEuler;
-            imu::Vector<3> imuAcc;
-            imu::Vector<3> imuGyro;
             bool imuSampleValid = false;
+            float accelX = 0.0f;
+            float accelY = 0.0f;
+            float accelZ = 0.0f;
+            float gyroX_dps = 0.0f;
+            float gyroY_dps = 0.0f;
+            float gyroZ_dps = 0.0f;
 
             if (bnoReady)
             {
-                imuEuler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-                imuMag = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
-                imuAcc = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
-                imuGyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
-                imuSampleValid = true;
+                imuSampleValid = readBnoRawAccelGyro(accelX,
+                                                     accelY,
+                                                     accelZ,
+                                                     gyroX_dps,
+                                                     gyroY_dps,
+                                                     gyroZ_dps);
             }
 
             // apply hard/soft iron correction
@@ -376,10 +438,6 @@ void loop()
 
             if (imuSampleValid)
             {
-                float accelX = imuAcc.x();
-                float accelY = imuAcc.y();
-                float accelZ = imuAcc.z();
-
                 float roll = atan2f(accelY, accelZ);
                 float pitch = atan2f(-accelX, sqrtf(accelY * accelY + accelZ * accelZ));
 
@@ -407,7 +465,7 @@ void loop()
                 lastFusionTime = currentMillis;
                 if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
 
-                float gyroZ_dps = clampf(imuGyro.z(), -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
+                gyroZ_dps = clampf(gyroZ_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
                 float accelNorm = sqrtf((accelX * accelX) + (accelY * accelY) + (accelZ * accelZ));
                 bool isStationary = (fabsf(accelNorm - 9.81f) < STATIONARY_ACCEL_TOL) &&
                                     (fabsf(gyroZ_dps) < STATIONARY_GYRO_TOL_DPS);
