@@ -327,24 +327,34 @@ unsigned long lastFusionTime = 0;
 bool yawInitialized = false;
 float fusedYawDeg = 0.0f;
 bool yawWasRestoredFromNv = false;
-bool magHeadingFilteredReady = false;
-float magHeadingFilteredDeg = 0.0f;
 float referenceFieldNorm_uT = 0.0f;
 bool fieldReferenceReady = false;
 bool magDisturbed = false;
-float gyroZBiasDps = 0.0f;
+bool ahrsInitialized = false;
+float q0 = 1.0f;
+float q1 = 0.0f;
+float q2 = 0.0f;
+float q3 = 0.0f;
+float gyroBiasXDps = 0.0f;
+float gyroBiasYDps = 0.0f;
+float gyroBiasZDps = 0.0f;
 bool gyroBiasReady = false;
 
-const float MAG_CORRECTION_GAIN_STILL = 0.035f;
-const float MAG_CORRECTION_GAIN_ROTATING = 0.006f;
-const float MAG_HEADING_LPF_ALPHA = 0.12f;
-const float MAG_MAX_CORRECTION_DPS = 20.0f;
-const float ROTATION_FAST_THRESHOLD_DPS = 25.0f;
 const float MAG_DISTURB_THRESHOLD_FRAC = 0.30f;
 const float STATIONARY_ACCEL_TOL = 0.35f;
 const float STATIONARY_GYRO_TOL_DPS = 1.0f;
 const float GYRO_BIAS_ALPHA = 0.02f;
 const float GYRO_RATE_CLAMP_DPS = 250.0f;
+const float MAHONY_KP = 2.2f;
+const float MAHONY_KI = 0.02f;
+const float MAHONY_MAG_WEIGHT = 1.0f;
+
+float integralFBx = 0.0f;
+float integralFBy = 0.0f;
+float integralFBz = 0.0f;
+
+const float DEG2RAD = 0.01745329251994329576923690768489f;
+const float RAD2DEG = 57.295779513082320876798154814105f;
 
 float clampf(float value, float minValue, float maxValue)
 {
@@ -365,6 +375,156 @@ float wrap180(float angle)
     while (angle <= -180.0f) angle += 360.0f;
     while (angle > 180.0f) angle -= 360.0f;
     return angle;
+}
+
+float invSqrt(float value)
+{
+    if (value <= 0.0f)
+        return 0.0f;
+    return 1.0f / sqrtf(value);
+}
+
+void setQuaternionFromEuler(float rollRad, float pitchRad, float yawRad)
+{
+    float cr = cosf(rollRad * 0.5f);
+    float sr = sinf(rollRad * 0.5f);
+    float cp = cosf(pitchRad * 0.5f);
+    float sp = sinf(pitchRad * 0.5f);
+    float cy = cosf(yawRad * 0.5f);
+    float sy = sinf(yawRad * 0.5f);
+
+    q0 = (cr * cp * cy) + (sr * sp * sy);
+    q1 = (sr * cp * cy) - (cr * sp * sy);
+    q2 = (cr * sp * cy) + (sr * cp * sy);
+    q3 = (cr * cp * sy) - (sr * sp * cy);
+
+    float recipNorm = invSqrt((q0 * q0) + (q1 * q1) + (q2 * q2) + (q3 * q3));
+    if (recipNorm > 0.0f)
+    {
+        q0 *= recipNorm;
+        q1 *= recipNorm;
+        q2 *= recipNorm;
+        q3 *= recipNorm;
+    }
+}
+
+float quaternionYawDeg()
+{
+    float yaw = atan2f(2.0f * ((q0 * q3) + (q1 * q2)),
+                       1.0f - (2.0f * ((q2 * q2) + (q3 * q3))));
+    return wrap360(yaw * RAD2DEG);
+}
+
+void initializeAhrsPose(float accelX, float accelY, float accelZ,
+                        float magX, float magY, float magZ,
+                        float yawSeedDeg, bool useYawSeed)
+{
+    float roll = atan2f(accelY, accelZ);
+    float pitch = atan2f(-accelX, sqrtf((accelY * accelY) + (accelZ * accelZ)));
+
+    float mxh = (magX * cosf(pitch)) + (magZ * sinf(pitch));
+    float myh = (magX * sinf(roll) * sinf(pitch)) + (magY * cosf(roll)) - (magZ * sinf(roll) * cosf(pitch));
+
+    float yaw = atan2f(myh, mxh);
+    if (useYawSeed)
+        yaw = wrap360(yawSeedDeg) * DEG2RAD;
+
+    setQuaternionFromEuler(roll, pitch, yaw);
+    ahrsInitialized = true;
+}
+
+void updateAhrsMahony(float dt,
+                      float gxRad,
+                      float gyRad,
+                      float gzRad,
+                      float ax,
+                      float ay,
+                      float az,
+                      float mx,
+                      float my,
+                      float mz,
+                      float magWeight)
+{
+    float recipNorm = invSqrt((ax * ax) + (ay * ay) + (az * az));
+    if (recipNorm <= 0.0f)
+        return;
+
+    ax *= recipNorm;
+    ay *= recipNorm;
+    az *= recipNorm;
+
+    float vx = 2.0f * ((q1 * q3) - (q0 * q2));
+    float vy = 2.0f * ((q0 * q1) + (q2 * q3));
+    float vz = (q0 * q0) - (q1 * q1) - (q2 * q2) + (q3 * q3);
+
+    float ex = (ay * vz) - (az * vy);
+    float ey = (az * vx) - (ax * vz);
+    float ez = (ax * vy) - (ay * vx);
+
+    if (magWeight > 0.0f)
+    {
+        recipNorm = invSqrt((mx * mx) + (my * my) + (mz * mz));
+        if (recipNorm > 0.0f)
+        {
+            mx *= recipNorm;
+            my *= recipNorm;
+            mz *= recipNorm;
+
+            float q0q1 = q0 * q1;
+            float q0q2 = q0 * q2;
+            float q0q3 = q0 * q3;
+            float q1q1 = q1 * q1;
+            float q1q2 = q1 * q2;
+            float q1q3 = q1 * q3;
+            float q2q2 = q2 * q2;
+            float q2q3 = q2 * q3;
+            float q3q3 = q3 * q3;
+
+            float hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
+            float hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
+            float bx = sqrtf((hx * hx) + (hy * hy));
+            float bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
+
+            float wx = 2.0f * (bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2));
+            float wy = 2.0f * (bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3));
+            float wz = 2.0f * (bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2));
+
+            float mex = (my * wz) - (mz * wy);
+            float mey = (mz * wx) - (mx * wz);
+            float mez = (mx * wy) - (my * wx);
+
+            ex += mex * magWeight;
+            ey += mey * magWeight;
+            ez += mez * magWeight;
+        }
+    }
+
+    integralFBx += (MAHONY_KI * ex * dt);
+    integralFBy += (MAHONY_KI * ey * dt);
+    integralFBz += (MAHONY_KI * ez * dt);
+
+    gxRad += (MAHONY_KP * ex) + integralFBx;
+    gyRad += (MAHONY_KP * ey) + integralFBy;
+    gzRad += (MAHONY_KP * ez) + integralFBz;
+
+    float qDot0 = 0.5f * ((-q1 * gxRad) - (q2 * gyRad) - (q3 * gzRad));
+    float qDot1 = 0.5f * ((q0 * gxRad) + (q2 * gzRad) - (q3 * gyRad));
+    float qDot2 = 0.5f * ((q0 * gyRad) - (q1 * gzRad) + (q3 * gxRad));
+    float qDot3 = 0.5f * ((q0 * gzRad) + (q1 * gyRad) - (q2 * gxRad));
+
+    q0 += qDot0 * dt;
+    q1 += qDot1 * dt;
+    q2 += qDot2 * dt;
+    q3 += qDot3 * dt;
+
+    recipNorm = invSqrt((q0 * q0) + (q1 * q1) + (q2 * q2) + (q3 * q3));
+    if (recipNorm > 0.0f)
+    {
+        q0 *= recipNorm;
+        q1 *= recipNorm;
+        q2 *= recipNorm;
+        q3 *= recipNorm;
+    }
 }
 
 void restorePersistentState()
@@ -575,66 +735,47 @@ void loop()
             float heading_mag = atan2f(y_corrected, x_corrected) * 180.0f / M_PI;
             heading_mag = wrap360(heading_mag);
 
-            float heading_tilt = heading_mag;
             float heading_fused = yawInitialized ? fusedYawDeg : heading_mag;
 
             if (imuSampleValid)
             {
-                float roll = atan2f(accelY, accelZ);
-                float pitch = atan2f(-accelX, sqrtf(accelY * accelY + accelZ * accelZ));
+                float dt = (currentMillis - lastFusionTime) * 0.001f;
+                lastFusionTime = currentMillis;
+                if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
 
                 float mx = x_corrected;
                 float my = y_corrected;
                 float mz = z_corrected;
 
-                float mxh = (mx * cosf(pitch)) + (mz * sinf(pitch));
-                float myh = (mx * sinf(roll) * sinf(pitch)) + (my * cosf(roll)) - (mz * sinf(roll) * cosf(pitch));
-
-                heading_tilt = wrap360(atan2f(myh, mxh) * 180.0f / M_PI);
-
-                if (!magHeadingFilteredReady)
-                {
-                    magHeadingFilteredDeg = heading_tilt;
-                    magHeadingFilteredReady = true;
-                }
-                else
-                {
-                    float magDelta = wrap180(heading_tilt - magHeadingFilteredDeg);
-                    magHeadingFilteredDeg = wrap360(magHeadingFilteredDeg + (MAG_HEADING_LPF_ALPHA * magDelta));
-                }
-
-                float dt = (currentMillis - lastFusionTime) * 0.001f;
-                lastFusionTime = currentMillis;
-                if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;
-
+                gyroX_dps = clampf(gyroX_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
+                gyroY_dps = clampf(gyroY_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
                 gyroZ_dps = clampf(gyroZ_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
+
                 float accelNorm = sqrtf((accelX * accelX) + (accelY * accelY) + (accelZ * accelZ));
+                float gyroNormDps = sqrtf((gyroX_dps * gyroX_dps) + (gyroY_dps * gyroY_dps) + (gyroZ_dps * gyroZ_dps));
                 bool isStationary = (fabsf(accelNorm - 9.81f) < STATIONARY_ACCEL_TOL) &&
-                                    (fabsf(gyroZ_dps) < STATIONARY_GYRO_TOL_DPS);
+                                    (gyroNormDps < STATIONARY_GYRO_TOL_DPS);
 
                 if (isStationary)
                 {
                     if (!gyroBiasReady)
                     {
-                        gyroZBiasDps = gyroZ_dps;
+                        gyroBiasXDps = gyroX_dps;
+                        gyroBiasYDps = gyroY_dps;
+                        gyroBiasZDps = gyroZ_dps;
                         gyroBiasReady = true;
                     }
                     else
                     {
-                        gyroZBiasDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroZBiasDps) + (GYRO_BIAS_ALPHA * gyroZ_dps);
+                        gyroBiasXDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroBiasXDps) + (GYRO_BIAS_ALPHA * gyroX_dps);
+                        gyroBiasYDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroBiasYDps) + (GYRO_BIAS_ALPHA * gyroY_dps);
+                        gyroBiasZDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroBiasZDps) + (GYRO_BIAS_ALPHA * gyroZ_dps);
                     }
                 }
 
-                float gyroZCorrected_dps = gyroZ_dps - gyroZBiasDps;
-
-                if (!yawInitialized)
-                {
-                    fusedYawDeg = heading_tilt;
-                    yawInitialized = true;
-                    checkpointPersistentState(currentMillis, true);
-                }
-
-                fusedYawDeg = wrap360(fusedYawDeg + gyroZCorrected_dps * dt);
+                float gyroXCorrected_dps = gyroX_dps - gyroBiasXDps;
+                float gyroYCorrected_dps = gyroY_dps - gyroBiasYDps;
+                float gyroZCorrected_dps = gyroZ_dps - gyroBiasZDps;
 
                 float fieldNorm = sqrtf((mx * mx) + (my * my) + (mz * mz));
                 if (!fieldReferenceReady)
@@ -647,22 +788,45 @@ void loop()
                                       (referenceFieldNorm_uT > 0.001f ? referenceFieldNorm_uT : 1.0f);
                 magDisturbed = normErrorFrac > MAG_DISTURB_THRESHOLD_FRAC;
 
+                if (!ahrsInitialized)
+                {
+                    initializeAhrsPose(accelX,
+                                       accelY,
+                                       accelZ,
+                                       mx,
+                                       my,
+                                       mz,
+                                       fusedYawDeg,
+                                       yawWasRestoredFromNv && yawInitialized);
+
+                    if (!yawInitialized)
+                    {
+                        fusedYawDeg = quaternionYawDeg();
+                        yawInitialized = true;
+                        checkpointPersistentState(currentMillis, true);
+                    }
+                }
+
+                float magWeight = 0.0f;
                 if (!magDisturbed)
                 {
                     referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
-                    float yawError = wrap180(magHeadingFilteredDeg - fusedYawDeg);
-
-                    float rotationRateDps = fabsf(gyroZCorrected_dps);
-                    float correctionGain = (rotationRateDps > ROTATION_FAST_THRESHOLD_DPS)
-                                               ? MAG_CORRECTION_GAIN_ROTATING
-                                               : MAG_CORRECTION_GAIN_STILL;
-
-                    float magCorrection = correctionGain * yawError;
-                    float maxCorrectionStep = MAG_MAX_CORRECTION_DPS * dt;
-                    magCorrection = clampf(magCorrection, -maxCorrectionStep, maxCorrectionStep);
-                    fusedYawDeg = wrap360(fusedYawDeg + magCorrection);
+                    magWeight = MAHONY_MAG_WEIGHT;
                 }
 
+                updateAhrsMahony(dt,
+                                 gyroXCorrected_dps * DEG2RAD,
+                                 gyroYCorrected_dps * DEG2RAD,
+                                 gyroZCorrected_dps * DEG2RAD,
+                                 accelX,
+                                 accelY,
+                                 accelZ,
+                                 mx,
+                                 my,
+                                 mz,
+                                 magWeight);
+
+                fusedYawDeg = quaternionYawDeg();
                 heading_fused = fusedYawDeg;
             }
 
