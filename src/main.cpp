@@ -12,18 +12,19 @@
 #define BNO055_PAGE_ID_ADDR 0x07
 #define BNO055_ACCEL_DATA_X_LSB_ADDR 0x08
 #define BNO055_GYRO_DATA_X_LSB_ADDR 0x14
-#define BNO055_CALIB_STAT_ADDR 0x35
 #define BNO055_UNIT_SEL_ADDR 0x3B
 #define BNO055_OPR_MODE_ADDR 0x3D
 #define BNO055_PWR_MODE_ADDR 0x3E
 #define BNO055_SYS_TRIGGER_ADDR 0x3F
-#define BNO055_ACC_OFFSET_X_LSB_ADDR 0x55
 
 #define BNO055_CHIP_ID 0xA0
 #define BNO055_OPERATION_MODE_CONFIG 0x00
-#define BNO055_OPERATION_MODE_NDOF 0x0C
+#define BNO055_OPERATION_MODE_ACCGYRO 0x05
 #define BNO055_POWER_MODE_NORMAL 0x00
-#define BNO055_OFFSETS_LEN 22
+
+/* Page 1 sensor configuration registers */
+#define BNO055_ACC_CONFIG_ADDR 0x08
+#define BNO055_GYR_CONFIG0_ADDR 0x0A
 
 bool bnoReady = false;
 uint8_t bnoMode = BNO055_OPERATION_MODE_CONFIG;
@@ -61,21 +62,7 @@ bool setBnoOperationMode(uint8_t mode)
     return true;
 }
 
-bool bnoSetExtCrystalUse(bool useExternalCrystal)
-{
-    uint8_t modeToRestore = bnoMode;
-    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
-        return false;
-
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
-        return false;
-
-    if (!writeBnoReg(BNO055_SYS_TRIGGER_ADDR, useExternalCrystal ? 0x80 : 0x00))
-        return false;
-
-    delay(10);
-    return setBnoOperationMode(modeToRestore);
-}
+/* bnoSetExtCrystalUse removed — only relevant for fusion modes */
 
 bool bnoBegin()
 {
@@ -117,59 +104,33 @@ bool bnoBegin()
 
     delay(10);
 
-    if (!setBnoOperationMode(BNO055_OPERATION_MODE_NDOF))
+    /* ---- Configure accel & gyro ranges on Page 1 ---- */
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x01))
+        return false;
+
+    /* ACC_Config: bandwidth 62.5 Hz (bits 4:2 = 011), range ±4g (bits 1:0 = 01) */
+    if (!writeBnoReg(BNO055_ACC_CONFIG_ADDR, 0x0D))
+        return false;
+
+    /* GYR_Config_0: bandwidth 116 Hz (bits 5:3 = 010), range ±2000 dps (bits 2:0 = 000) */
+    if (!writeBnoReg(BNO055_GYR_CONFIG0_ADDR, 0x10))
+        return false;
+
+    /* Switch back to Page 0 */
+    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+        return false;
+
+    delay(10);
+
+    /* ACCGYRO: raw accel + gyro, no on-chip fusion */
+    if (!setBnoOperationMode(BNO055_OPERATION_MODE_ACCGYRO))
         return false;
 
     return true;
 }
 
-bool bnoGetSensorOffsets(uint8_t *offsets)
-{
-    uint8_t modeToRestore = bnoMode;
-    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
-        return false;
-
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
-        return false;
-
-    bool ok = readBnoReg(BNO055_ACC_OFFSET_X_LSB_ADDR, offsets, BNO055_OFFSETS_LEN);
-    if (!setBnoOperationMode(modeToRestore))
-        return false;
-
-    return ok;
-}
-
-bool bnoSetSensorOffsets(const uint8_t *offsets)
-{
-    uint8_t modeToRestore = bnoMode;
-    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
-        return false;
-
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
-        return false;
-
-    for (uint8_t i = 0; i < BNO055_OFFSETS_LEN; i++)
-    {
-        if (!writeBnoReg(static_cast<uint8_t>(BNO055_ACC_OFFSET_X_LSB_ADDR + i), offsets[i]))
-            return false;
-    }
-
-    return setBnoOperationMode(modeToRestore);
-}
-
-bool bnoIsFullyCalibrated()
-{
-    uint8_t calib = 0;
-    if (!readBnoReg(BNO055_CALIB_STAT_ADDR, &calib, 1))
-        return false;
-
-    uint8_t sys = (calib >> 6) & 0x03;
-    uint8_t gyro = (calib >> 4) & 0x03;
-    uint8_t accel = (calib >> 2) & 0x03;
-    uint8_t mag = calib & 0x03;
-
-    return (sys == 3) && (gyro == 3) && (accel == 3) && (mag == 3);
-}
+/* bnoGetSensorOffsets / bnoSetSensorOffsets / bnoIsFullyCalibrated removed
+   — they depend on the NDOF fusion calibration system which is no longer used. */
 
 int16_t decodeBnoInt16(uint8_t lsb, uint8_t msb)
 {
@@ -217,20 +178,17 @@ struct PersistedState
     uint16_t checksum;
     float lastYawDeg;
     uint8_t yawValid;
-    uint8_t bnoOffsetsValid;
-    uint8_t reserved[2];
-    uint8_t bnoOffsets[BNO055_OFFSETS_LEN];
+    uint8_t reserved[3];
 };
 
 const uint32_t PERSIST_MAGIC = 0x4D494D55UL;
-const uint16_t PERSIST_VERSION = 1;
+const uint16_t PERSIST_VERSION = 2;
 const int EEPROM_ADDR = 0;
 const unsigned long EEPROM_SAVE_INTERVAL_MS = 2000;
 const float EEPROM_SAVE_MIN_DELTA_DEG = 0.5f;
 
 unsigned long lastEepromSaveMs = 0;
 float lastSavedYawDeg = 0.0f;
-bool savedOffsetsAlready = false;
 
 uint16_t computePersistChecksum(const PersistedState &state)
 {
@@ -512,12 +470,6 @@ void restorePersistentState()
     if (!loadPersistedState(state))
         return;
 
-    if (bnoReady && state.bnoOffsetsValid)
-    {
-        if (bnoSetSensorOffsets(state.bnoOffsets))
-            savedOffsetsAlready = true;
-    }
-
     if (state.yawValid)
     {
         fusedYawDeg = wrap360(state.lastYawDeg);
@@ -532,40 +484,17 @@ void checkpointPersistentState(unsigned long nowMs, bool forceSave)
     if (!forceSave && (nowMs - lastEepromSaveMs) < EEPROM_SAVE_INTERVAL_MS)
         return;
 
-    PersistedState state = {};
-    bool haveAnythingToSave = false;
-
-    if (yawInitialized)
-    {
-        state.lastYawDeg = wrap360(fusedYawDeg);
-        state.yawValid = 1;
-        haveAnythingToSave = true;
-    }
-
-    if (bnoReady)
-    {
-        uint8_t offsets[BNO055_OFFSETS_LEN];
-        if (bnoGetSensorOffsets(offsets))
-        {
-            memcpy(state.bnoOffsets, offsets, BNO055_OFFSETS_LEN);
-            state.bnoOffsetsValid = 1;
-            haveAnythingToSave = true;
-        }
-    }
-
-    if (!haveAnythingToSave)
+    if (!yawInitialized)
         return;
+
+    PersistedState state = {};
+    state.lastYawDeg = wrap360(fusedYawDeg);
+    state.yawValid = 1;
 
     bool shouldSave = forceSave;
 
-    if (state.yawValid)
-    {
-        float yawDeltaDeg = fabsf(wrap180(state.lastYawDeg - lastSavedYawDeg));
-        if (yawDeltaDeg >= EEPROM_SAVE_MIN_DELTA_DEG)
-            shouldSave = true;
-    }
-
-    if (state.bnoOffsetsValid && !savedOffsetsAlready && bnoReady && bnoIsFullyCalibrated())
+    float yawDeltaDeg = fabsf(wrap180(state.lastYawDeg - lastSavedYawDeg));
+    if (yawDeltaDeg >= EEPROM_SAVE_MIN_DELTA_DEG)
         shouldSave = true;
 
     if (!shouldSave)
@@ -573,11 +502,7 @@ void checkpointPersistentState(unsigned long nowMs, bool forceSave)
 
     savePersistedState(state);
     lastEepromSaveMs = nowMs;
-
-    if (state.yawValid)
-        lastSavedYawDeg = state.lastYawDeg;
-    if (state.bnoOffsetsValid)
-        savedOffsetsAlready = true;
+    lastSavedYawDeg = state.lastYawDeg;
 }
 
 /* ---- Init state machine ---- */
@@ -602,8 +527,6 @@ void setup()
     Wire.begin();
 
     bnoReady = bnoBegin();
-    if (bnoReady)
-        bnoSetExtCrystalUse(true);
 
     restorePersistentState();
     lastEepromSaveMs = millis();
