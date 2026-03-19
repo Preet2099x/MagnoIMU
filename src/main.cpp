@@ -330,28 +330,27 @@ bool yawWasRestoredFromNv = false;
 float referenceFieldNorm_uT = 0.0f;
 bool fieldReferenceReady = false;
 bool magDisturbed = false;
-bool ahrsInitialized = false;
-float q0 = 1.0f;
-float q1 = 0.0f;
-float q2 = 0.0f;
-float q3 = 0.0f;
-float gyroBiasXDps = 0.0f;
-float gyroBiasYDps = 0.0f;
-float gyroBiasZDps = 0.0f;
-bool gyroBiasReady = false;
+bool ekfInitialized = false;
+float ekfYawRad = 0.0f;
+float ekfGyroBiasRad = 0.0f;
+float ekfP00 = 0.35f;
+float ekfP01 = 0.0f;
+float ekfP10 = 0.0f;
+float ekfP11 = 0.05f;
 
 const float MAG_DISTURB_THRESHOLD_FRAC = 0.30f;
 const float STATIONARY_ACCEL_TOL = 0.35f;
 const float STATIONARY_GYRO_TOL_DPS = 1.0f;
-const float GYRO_BIAS_ALPHA = 0.02f;
 const float GYRO_RATE_CLAMP_DPS = 250.0f;
-const float MAHONY_KP = 2.2f;
-const float MAHONY_KI = 0.02f;
-const float MAHONY_MAG_WEIGHT = 1.0f;
-
-float integralFBx = 0.0f;
-float integralFBy = 0.0f;
-float integralFBz = 0.0f;
+const float EKF_GYRO_NOISE_STD_RADPS = 0.25f;
+const float EKF_BIAS_RW_STD_RADPS2 = 0.002f;
+const float EKF_MAG_MEAS_STD_RAD = 0.08f;
+const float EKF_MAG_MEAS_STD_RAD_STILL = 0.015f;
+const float EKF_ZERO_RATE_STD_RADPS = 0.02f;
+const float EKF_MIN_P00 = 1.0e-5f;
+const float EKF_MAX_P11 = 0.25f;
+const float MAG_MIN_HORIZONTAL_FIELD_uT = 5.0f;
+const float EKF_MAG_INNOVATION_GATE_SIGMA = 3.0f;
 
 const float DEG2RAD = 0.01745329251994329576923690768489f;
 const float RAD2DEG = 57.295779513082320876798154814105f;
@@ -377,154 +376,134 @@ float wrap180(float angle)
     return angle;
 }
 
-float invSqrt(float value)
+float wrapPi(float angle)
 {
-    if (value <= 0.0f)
-        return 0.0f;
-    return 1.0f / sqrtf(value);
+    while (angle <= -M_PI) angle += 2.0f * M_PI;
+    while (angle > M_PI) angle -= 2.0f * M_PI;
+    return angle;
 }
 
-void setQuaternionFromEuler(float rollRad, float pitchRad, float yawRad)
+void initializeEkfYaw(float yawRadSeed)
 {
-    float cr = cosf(rollRad * 0.5f);
-    float sr = sinf(rollRad * 0.5f);
-    float cp = cosf(pitchRad * 0.5f);
-    float sp = sinf(pitchRad * 0.5f);
-    float cy = cosf(yawRad * 0.5f);
-    float sy = sinf(yawRad * 0.5f);
-
-    q0 = (cr * cp * cy) + (sr * sp * sy);
-    q1 = (sr * cp * cy) - (cr * sp * sy);
-    q2 = (cr * sp * cy) + (sr * cp * sy);
-    q3 = (cr * cp * sy) - (sr * sp * cy);
-
-    float recipNorm = invSqrt((q0 * q0) + (q1 * q1) + (q2 * q2) + (q3 * q3));
-    if (recipNorm > 0.0f)
-    {
-        q0 *= recipNorm;
-        q1 *= recipNorm;
-        q2 *= recipNorm;
-        q3 *= recipNorm;
-    }
+    ekfYawRad = wrapPi(yawRadSeed);
+    ekfGyroBiasRad = 0.0f;
+    ekfP00 = 0.35f;
+    ekfP01 = 0.0f;
+    ekfP10 = 0.0f;
+    ekfP11 = 0.05f;
+    ekfInitialized = true;
 }
 
-float quaternionYawDeg()
+void ekfPredict(float dt, float gyroZRad)
 {
-    float yaw = atan2f(2.0f * ((q0 * q3) + (q1 * q2)),
-                       1.0f - (2.0f * ((q2 * q2) + (q3 * q3))));
-    return wrap360(yaw * RAD2DEG);
+    float qYaw = EKF_GYRO_NOISE_STD_RADPS * EKF_GYRO_NOISE_STD_RADPS * dt;
+    float qBias = EKF_BIAS_RW_STD_RADPS2 * EKF_BIAS_RW_STD_RADPS2 * dt;
+
+    ekfYawRad = wrapPi(ekfYawRad + (gyroZRad - ekfGyroBiasRad) * dt);
+
+    float oldP00 = ekfP00;
+    float oldP01 = ekfP01;
+    float oldP10 = ekfP10;
+    float oldP11 = ekfP11;
+
+    ekfP00 = oldP00 - dt * oldP10 - dt * oldP01 + dt * dt * oldP11 + qYaw;
+    ekfP01 = oldP01 - dt * oldP11;
+    ekfP10 = oldP10 - dt * oldP11;
+    ekfP11 = oldP11 + qBias;
+
+    if (ekfP00 < EKF_MIN_P00)
+        ekfP00 = EKF_MIN_P00;
+    if (ekfP11 > EKF_MAX_P11)
+        ekfP11 = EKF_MAX_P11;
 }
 
-void initializeAhrsPose(float accelX, float accelY, float accelZ,
-                        float magX, float magY, float magZ,
-                        float yawSeedDeg, bool useYawSeed)
+void ekfUpdateFromMagYaw(float magYawRad, float measurementStdRad)
 {
-    float roll = atan2f(accelY, accelZ);
-    float pitch = atan2f(-accelX, sqrtf((accelY * accelY) + (accelZ * accelZ)));
-
-    float mxh = (magX * cosf(pitch)) + (magZ * sinf(pitch));
-    float myh = (magX * sinf(roll) * sinf(pitch)) + (magY * cosf(roll)) - (magZ * sinf(roll) * cosf(pitch));
-
-    float yaw = atan2f(myh, mxh);
-    if (useYawSeed)
-        yaw = wrap360(yawSeedDeg) * DEG2RAD;
-
-    setQuaternionFromEuler(roll, pitch, yaw);
-    ahrsInitialized = true;
-}
-
-void updateAhrsMahony(float dt,
-                      float gxRad,
-                      float gyRad,
-                      float gzRad,
-                      float ax,
-                      float ay,
-                      float az,
-                      float mx,
-                      float my,
-                      float mz,
-                      float magWeight)
-{
-    float recipNorm = invSqrt((ax * ax) + (ay * ay) + (az * az));
-    if (recipNorm <= 0.0f)
+    float r = measurementStdRad * measurementStdRad;
+    float innovation = wrapPi(magYawRad - ekfYawRad);
+    float s = ekfP00 + r;
+    if (s <= 1e-9f)
         return;
 
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
+    float k0 = ekfP00 / s;
+    float k1 = ekfP10 / s;
 
-    float vx = 2.0f * ((q1 * q3) - (q0 * q2));
-    float vy = 2.0f * ((q0 * q1) + (q2 * q3));
-    float vz = (q0 * q0) - (q1 * q1) - (q2 * q2) + (q3 * q3);
+    ekfYawRad = wrapPi(ekfYawRad + k0 * innovation);
+    ekfGyroBiasRad += k1 * innovation;
 
-    float ex = (ay * vz) - (az * vy);
-    float ey = (az * vx) - (ax * vz);
-    float ez = (ax * vy) - (ay * vx);
+    float oldP00 = ekfP00;
+    float oldP01 = ekfP01;
+    float oldP10 = ekfP10;
+    float oldP11 = ekfP11;
 
-    if (magWeight > 0.0f)
-    {
-        recipNorm = invSqrt((mx * mx) + (my * my) + (mz * mz));
-        if (recipNorm > 0.0f)
-        {
-            mx *= recipNorm;
-            my *= recipNorm;
-            mz *= recipNorm;
+    ekfP00 = oldP00 - k0 * oldP00;
+    ekfP01 = oldP01 - k0 * oldP01;
+    ekfP10 = oldP10 - k1 * oldP00;
+    ekfP11 = oldP11 - k1 * oldP01;
 
-            float q0q1 = q0 * q1;
-            float q0q2 = q0 * q2;
-            float q0q3 = q0 * q3;
-            float q1q1 = q1 * q1;
-            float q1q2 = q1 * q2;
-            float q1q3 = q1 * q3;
-            float q2q2 = q2 * q2;
-            float q2q3 = q2 * q3;
-            float q3q3 = q3 * q3;
+    float pSym = 0.5f * (ekfP01 + ekfP10);
+    ekfP01 = pSym;
+    ekfP10 = pSym;
 
-            float hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
-            float hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
-            float bx = sqrtf((hx * hx) + (hy * hy));
-            float bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
+    if (ekfP00 < EKF_MIN_P00)
+        ekfP00 = EKF_MIN_P00;
+    if (ekfP11 < 1.0e-7f)
+        ekfP11 = 1.0e-7f;
+}
 
-            float wx = 2.0f * (bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2));
-            float wy = 2.0f * (bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3));
-            float wz = 2.0f * (bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2));
+bool shouldUseMagYaw(float magYawRad,
+                     float measurementStdRad,
+                     bool magneticEnvironmentHealthy,
+                     float horizontalField_uT)
+{
+    if (!magneticEnvironmentHealthy)
+        return false;
 
-            float mex = (my * wz) - (mz * wy);
-            float mey = (mz * wx) - (mx * wz);
-            float mez = (mx * wy) - (my * wx);
+    if (horizontalField_uT < MAG_MIN_HORIZONTAL_FIELD_uT)
+        return false;
 
-            ex += mex * magWeight;
-            ey += mey * magWeight;
-            ez += mez * magWeight;
-        }
-    }
+    float innovation = wrapPi(magYawRad - ekfYawRad);
+    float r = measurementStdRad * measurementStdRad;
+    float s = ekfP00 + r;
+    if (s <= 1e-9f)
+        return false;
 
-    integralFBx += (MAHONY_KI * ex * dt);
-    integralFBy += (MAHONY_KI * ey * dt);
-    integralFBz += (MAHONY_KI * ez * dt);
+    float gate = EKF_MAG_INNOVATION_GATE_SIGMA * sqrtf(s);
+    return fabsf(innovation) <= gate;
+}
 
-    gxRad += (MAHONY_KP * ex) + integralFBx;
-    gyRad += (MAHONY_KP * ey) + integralFBy;
-    gzRad += (MAHONY_KP * ez) + integralFBz;
+void ekfUpdateZeroRate(float gyroZRad, float zeroRateStdRad)
+{
+    float r = zeroRateStdRad * zeroRateStdRad;
+    float innovation = gyroZRad - ekfGyroBiasRad;
+    float s = ekfP11 + r;
+    if (s <= 1e-12f)
+        return;
 
-    float qDot0 = 0.5f * ((-q1 * gxRad) - (q2 * gyRad) - (q3 * gzRad));
-    float qDot1 = 0.5f * ((q0 * gxRad) + (q2 * gzRad) - (q3 * gyRad));
-    float qDot2 = 0.5f * ((q0 * gyRad) - (q1 * gzRad) + (q3 * gxRad));
-    float qDot3 = 0.5f * ((q0 * gzRad) + (q1 * gyRad) - (q2 * gxRad));
+    float k0 = ekfP01 / s;
+    float k1 = ekfP11 / s;
 
-    q0 += qDot0 * dt;
-    q1 += qDot1 * dt;
-    q2 += qDot2 * dt;
-    q3 += qDot3 * dt;
+    ekfYawRad = wrapPi(ekfYawRad + k0 * innovation);
+    ekfGyroBiasRad += k1 * innovation;
 
-    recipNorm = invSqrt((q0 * q0) + (q1 * q1) + (q2 * q2) + (q3 * q3));
-    if (recipNorm > 0.0f)
-    {
-        q0 *= recipNorm;
-        q1 *= recipNorm;
-        q2 *= recipNorm;
-        q3 *= recipNorm;
-    }
+    float oldP00 = ekfP00;
+    float oldP01 = ekfP01;
+    float oldP10 = ekfP10;
+    float oldP11 = ekfP11;
+
+    ekfP00 = oldP00 - k0 * oldP10;
+    ekfP01 = oldP01 - k0 * oldP11;
+    ekfP10 = oldP10 - k1 * oldP10;
+    ekfP11 = oldP11 - k1 * oldP11;
+
+    float pSym = 0.5f * (ekfP01 + ekfP10);
+    ekfP01 = pSym;
+    ekfP10 = pSym;
+
+    if (ekfP00 < EKF_MIN_P00)
+        ekfP00 = EKF_MIN_P00;
+    if (ekfP11 < 1.0e-7f)
+        ekfP11 = 1.0e-7f;
 }
 
 void restorePersistentState()
@@ -727,6 +706,7 @@ void loop()
                                                      gyroZ_dps);
             }
 
+
             // apply hard/soft iron correction
             float x_corrected = (x_uT - HARD_IRON_X) * SOFT_IRON_X;
             float y_corrected = (y_uT - HARD_IRON_Y) * SOFT_IRON_Y;
@@ -747,6 +727,12 @@ void loop()
                 float my = y_corrected;
                 float mz = z_corrected;
 
+                float roll = atan2f(accelY, accelZ);
+                float pitch = atan2f(-accelX, sqrtf((accelY * accelY) + (accelZ * accelZ)));
+                float mxh = (mx * cosf(pitch)) + (mz * sinf(pitch));
+                float myh = (mx * sinf(roll) * sinf(pitch)) + (my * cosf(roll)) - (mz * sinf(roll) * cosf(pitch));
+                float heading_tilt = wrap360(atan2f(myh, mxh) * 180.0f / M_PI);
+
                 gyroX_dps = clampf(gyroX_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
                 gyroY_dps = clampf(gyroY_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
                 gyroZ_dps = clampf(gyroZ_dps, -GYRO_RATE_CLAMP_DPS, GYRO_RATE_CLAMP_DPS);
@@ -756,26 +742,7 @@ void loop()
                 bool isStationary = (fabsf(accelNorm - 9.81f) < STATIONARY_ACCEL_TOL) &&
                                     (gyroNormDps < STATIONARY_GYRO_TOL_DPS);
 
-                if (isStationary)
-                {
-                    if (!gyroBiasReady)
-                    {
-                        gyroBiasXDps = gyroX_dps;
-                        gyroBiasYDps = gyroY_dps;
-                        gyroBiasZDps = gyroZ_dps;
-                        gyroBiasReady = true;
-                    }
-                    else
-                    {
-                        gyroBiasXDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroBiasXDps) + (GYRO_BIAS_ALPHA * gyroX_dps);
-                        gyroBiasYDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroBiasYDps) + (GYRO_BIAS_ALPHA * gyroY_dps);
-                        gyroBiasZDps = ((1.0f - GYRO_BIAS_ALPHA) * gyroBiasZDps) + (GYRO_BIAS_ALPHA * gyroZ_dps);
-                    }
-                }
-
-                float gyroXCorrected_dps = gyroX_dps - gyroBiasXDps;
-                float gyroYCorrected_dps = gyroY_dps - gyroBiasYDps;
-                float gyroZCorrected_dps = gyroZ_dps - gyroBiasZDps;
+                float gyroZForEkf_dps = gyroZ_dps;
 
                 float fieldNorm = sqrtf((mx * mx) + (my * my) + (mz * mz));
                 if (!fieldReferenceReady)
@@ -788,45 +755,40 @@ void loop()
                                       (referenceFieldNorm_uT > 0.001f ? referenceFieldNorm_uT : 1.0f);
                 magDisturbed = normErrorFrac > MAG_DISTURB_THRESHOLD_FRAC;
 
-                if (!ahrsInitialized)
+                if (!ekfInitialized)
                 {
-                    initializeAhrsPose(accelX,
-                                       accelY,
-                                       accelZ,
-                                       mx,
-                                       my,
-                                       mz,
-                                       fusedYawDeg,
-                                       yawWasRestoredFromNv && yawInitialized);
+                    float yawSeedRad = (yawWasRestoredFromNv && yawInitialized)
+                                           ? wrap360(fusedYawDeg) * DEG2RAD
+                                           : heading_tilt * DEG2RAD;
+                    initializeEkfYaw(yawSeedRad);
 
                     if (!yawInitialized)
                     {
-                        fusedYawDeg = quaternionYawDeg();
+                        fusedYawDeg = wrap360(ekfYawRad * RAD2DEG);
                         yawInitialized = true;
                         checkpointPersistentState(currentMillis, true);
                     }
                 }
 
-                float magWeight = 0.0f;
-                if (!magDisturbed)
+                ekfPredict(dt, gyroZForEkf_dps * DEG2RAD);
+
+                if (isStationary)
                 {
-                    referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
-                    magWeight = MAHONY_MAG_WEIGHT;
+                    ekfUpdateZeroRate(gyroZForEkf_dps * DEG2RAD, EKF_ZERO_RATE_STD_RADPS);
                 }
 
-                updateAhrsMahony(dt,
-                                 gyroXCorrected_dps * DEG2RAD,
-                                 gyroYCorrected_dps * DEG2RAD,
-                                 gyroZCorrected_dps * DEG2RAD,
-                                 accelX,
-                                 accelY,
-                                 accelZ,
-                                 mx,
-                                 my,
-                                 mz,
-                                 magWeight);
+                float measStd = isStationary ? EKF_MAG_MEAS_STD_RAD_STILL : EKF_MAG_MEAS_STD_RAD;
+                bool magYawValid = shouldUseMagYaw(heading_tilt * DEG2RAD,
+                                                   measStd,
+                                                   !magDisturbed,
+                                                   sqrtf((mxh * mxh) + (myh * myh)));
+                if (magYawValid)
+                {
+                    referenceFieldNorm_uT = (0.98f * referenceFieldNorm_uT) + (0.02f * fieldNorm);
+                    ekfUpdateFromMagYaw(heading_tilt * DEG2RAD, measStd);
+                }
 
-                fusedYawDeg = quaternionYawDeg();
+                fusedYawDeg = wrap360(ekfYawRad * RAD2DEG);
                 heading_fused = fusedYawDeg;
             }
 
