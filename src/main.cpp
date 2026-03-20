@@ -22,7 +22,6 @@
 #define BNO055_OPERATION_MODE_ACCGYRO 0x05
 #define BNO055_POWER_MODE_NORMAL 0x00
 
-/* Page 1 sensor configuration registers */
 #define BNO055_ACC_CONFIG_ADDR 0x08
 #define BNO055_GYR_CONFIG0_ADDR 0x0A
 
@@ -61,8 +60,6 @@ bool setBnoOperationMode(uint8_t mode)
     delay(30);
     return true;
 }
-
-/* bnoSetExtCrystalUse removed — only relevant for fusion modes */
 
 bool bnoBegin()
 {
@@ -104,33 +101,25 @@ bool bnoBegin()
 
     delay(10);
 
-    /* ---- Configure accel & gyro ranges on Page 1 ---- */
     if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x01))
         return false;
 
-    /* ACC_Config: bandwidth 62.5 Hz (bits 4:2 = 011), range ±4g (bits 1:0 = 01) */
     if (!writeBnoReg(BNO055_ACC_CONFIG_ADDR, 0x0D))
         return false;
 
-    /* GYR_Config_0: bandwidth 116 Hz (bits 5:3 = 010), range ±2000 dps (bits 2:0 = 000) */
     if (!writeBnoReg(BNO055_GYR_CONFIG0_ADDR, 0x10))
         return false;
 
-    /* Switch back to Page 0 */
     if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
         return false;
 
     delay(10);
 
-    /* ACCGYRO: raw accel + gyro, no on-chip fusion */
     if (!setBnoOperationMode(BNO055_OPERATION_MODE_ACCGYRO))
         return false;
 
     return true;
 }
-
-/* bnoGetSensorOffsets / bnoSetSensorOffsets / bnoIsFullyCalibrated removed
-   — they depend on the NDOF fusion calibration system which is no longer used. */
 
 int16_t decodeBnoInt16(uint8_t lsb, uint8_t msb)
 {
@@ -171,6 +160,7 @@ bool readBnoRawAccelGyro(float &accelX_mps2,
     return true;
 }
 
+// Persisted state stored in EEPROM (keeps last yaw)
 struct PersistedState
 {
     uint32_t magic;
@@ -228,7 +218,7 @@ void savePersistedState(PersistedState state)
     EEPROM.put(EEPROM_ADDR, state);
 }
 
-/* I2C read (2 dummy bytes) */
+// BMM350 I2C read (2 dummy bytes)
 bool readReg(uint8_t reg, uint8_t *data, uint8_t len)
 {
     Wire.beginTransmission(BMM350_ADDR);
@@ -250,7 +240,7 @@ bool readReg(uint8_t reg, uint8_t *data, uint8_t len)
     return true;
 }
 
-/* I2C write */
+// BMM350 I2C write
 bool writeReg(uint8_t reg, uint8_t value)
 {
     Wire.beginTransmission(BMM350_ADDR);
@@ -266,20 +256,19 @@ void magneticReset()
     delay(20);
 }
 
-/* ---- Timing control ---- */
 unsigned long lastReadTime = 0;
-const unsigned long READ_INTERVAL = 10;  // 100 Hz
+const unsigned long READ_INTERVAL = 10;
 unsigned long lastPrintTime = 0;
 const unsigned long PRINT_INTERVAL = 100; // 10 Hz
  
- // Hard and soft iron calibration from calibration run
- const float HARD_IRON_X = 12.59f;
- const float HARD_IRON_Y = 4.65f;
- const float HARD_IRON_Z = -24.67f;
+// Hard/soft iron calibration constants
+const float HARD_IRON_X = 12.59f;
+const float HARD_IRON_Y = 4.65f;
+const float HARD_IRON_Z = -24.67f;
  
- const float SOFT_IRON_X = 0.747f;
- const float SOFT_IRON_Y = 0.875f;
- const float SOFT_IRON_Z = 1.926f;
+const float SOFT_IRON_X = 0.747f;
+const float SOFT_IRON_Y = 0.875f;
+const float SOFT_IRON_Z = 1.926f;
 
 unsigned long lastFusionTime = 0;
 bool yawInitialized = false;
@@ -313,6 +302,7 @@ const float EKF_MAG_INNOVATION_GATE_SIGMA = 3.0f;
 const float DEG2RAD = 0.01745329251994329576923690768489f;
 const float RAD2DEG = 57.295779513082320876798154814105f;
 
+// Math utilities
 float clampf(float value, float minValue, float maxValue)
 {
     if (value < minValue) return minValue;
@@ -341,6 +331,7 @@ float wrapPi(float angle)
     return angle;
 }
 
+// Extended Kalman Filter (1D yaw) helpers
 void initializeEkfYaw(float yawRadSeed)
 {
     ekfYawRad = wrapPi(yawRadSeed);
@@ -464,6 +455,7 @@ void ekfUpdateZeroRate(float gyroZRad, float zeroRateStdRad)
         ekfP11 = 1.0e-7f;
 }
 
+// Persistent state helpers
 void restorePersistentState()
 {
     PersistedState state;
@@ -505,7 +497,7 @@ void checkpointPersistentState(unsigned long nowMs, bool forceSave)
     lastSavedYawDeg = state.lastYawDeg;
 }
 
-/* ---- Init state machine ---- */
+// Init state machine
 enum InitState {
     INIT_WIRE_BEGIN,
     INIT_WAIT_WIRE,
@@ -629,8 +621,6 @@ void loop()
                                                      gyroZ_dps);
             }
 
-
-            // apply hard/soft iron correction
             float x_corrected = (x_uT - HARD_IRON_X) * SOFT_IRON_X;
             float y_corrected = (y_uT - HARD_IRON_Y) * SOFT_IRON_Y;
             float z_corrected = (z_uT - HARD_IRON_Z) * SOFT_IRON_Z;
