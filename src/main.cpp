@@ -6,44 +6,50 @@
 #include <EEPROM.h>
 
 #define BMM350_ADDR 0x14
-#define BNO055_ADDR 0x28
+#define BMI088_ACCEL_ADDR 0x18
+#define BMI088_GYRO_ADDR 0x68
 
-#define BNO055_CHIP_ID_ADDR 0x00
-#define BNO055_PAGE_ID_ADDR 0x07
-#define BNO055_ACCEL_DATA_X_LSB_ADDR 0x08
-#define BNO055_GYRO_DATA_X_LSB_ADDR 0x14
-#define BNO055_UNIT_SEL_ADDR 0x3B
-#define BNO055_OPR_MODE_ADDR 0x3D
-#define BNO055_PWR_MODE_ADDR 0x3E
-#define BNO055_SYS_TRIGGER_ADDR 0x3F
+#define BMI088_CHIP_ID_ADDR 0x00
+#define BMI088_ACCEL_CHIP_ID 0x1E
+#define BMI088_GYRO_CHIP_ID 0x0F
 
-#define BNO055_CHIP_ID 0xA0
-#define BNO055_OPERATION_MODE_CONFIG 0x00
-#define BNO055_OPERATION_MODE_ACCGYRO 0x05
-#define BNO055_POWER_MODE_NORMAL 0x00
+#define BMI088_ACCEL_DATA_X_LSB_ADDR 0x12
+#define BMI088_GYRO_DATA_X_LSB_ADDR 0x02
 
-#define BNO055_ACC_CONFIG_ADDR 0x08
-#define BNO055_GYR_CONFIG0_ADDR 0x0A
+#define BMI088_ACCEL_SOFTRESET_ADDR 0x7E
+#define BMI088_ACCEL_SOFTRESET_CMD 0xB6
+#define BMI088_ACCEL_PWR_CONF_ADDR 0x7C
+#define BMI088_ACCEL_PWR_CTRL_ADDR 0x7D
+#define BMI088_ACCEL_CONF_ADDR 0x40
+#define BMI088_ACCEL_RANGE_ADDR 0x41
+
+#define BMI088_GYRO_SOFTRESET_ADDR 0x14
+#define BMI088_GYRO_SOFTRESET_CMD 0xB6
+#define BMI088_GYRO_RANGE_ADDR 0x0F
+#define BMI088_GYRO_BW_ADDR 0x10
+#define BMI088_GYRO_LPM1_ADDR 0x11
 
 bool bnoReady = false;
-uint8_t bnoMode = BNO055_OPERATION_MODE_CONFIG;
+uint8_t bnoMode = 0;
+uint8_t bmiAccelAddr = BMI088_ACCEL_ADDR;
+uint8_t bmiGyroAddr = BMI088_GYRO_ADDR;
 
-bool writeBnoReg(uint8_t reg, uint8_t value)
+bool writeBmiReg(uint8_t addr, uint8_t reg, uint8_t value)
 {
-    Wire.beginTransmission(BNO055_ADDR);
+    Wire.beginTransmission(addr);
     Wire.write(reg);
     Wire.write(value);
     return (Wire.endTransmission() == 0);
 }
 
-bool readBnoReg(uint8_t reg, uint8_t *data, uint8_t len)
+bool readBmiReg(uint8_t addr, uint8_t reg, uint8_t *data, uint8_t len)
 {
-    Wire.beginTransmission(BNO055_ADDR);
+    Wire.beginTransmission(addr);
     Wire.write(reg);
     if (Wire.endTransmission(false) != 0)
         return false;
 
-    if (Wire.requestFrom(static_cast<uint8_t>(BNO055_ADDR), len) != len)
+    if (Wire.requestFrom(static_cast<uint8_t>(addr), len) != len)
         return false;
 
     for (uint8_t i = 0; i < len; i++)
@@ -54,68 +60,84 @@ bool readBnoReg(uint8_t reg, uint8_t *data, uint8_t len)
 
 bool setBnoOperationMode(uint8_t mode)
 {
-    if (!writeBnoReg(BNO055_OPR_MODE_ADDR, mode))
-        return false;
     bnoMode = mode;
-    delay(30);
+    delay(1);
     return true;
 }
 
 bool bnoBegin()
 {
-    uint8_t chipId = 0;
-    if (!readBnoReg(BNO055_CHIP_ID_ADDR, &chipId, 1) || chipId != BNO055_CHIP_ID)
+    const uint8_t accelAddrCandidates[] = {0x18, 0x19};
+    const uint8_t gyroAddrCandidates[] = {0x68, 0x69};
+    uint8_t accelChipId = 0;
+    uint8_t gyroChipId = 0;
+    bool accelFound = false;
+    bool gyroFound = false;
+
+    for (uint8_t i = 0; i < sizeof(accelAddrCandidates); i++)
     {
-        delay(650);
-        if (!readBnoReg(BNO055_CHIP_ID_ADDR, &chipId, 1) || chipId != BNO055_CHIP_ID)
-            return false;
+        if (readBmiReg(accelAddrCandidates[i], BMI088_CHIP_ID_ADDR, &accelChipId, 1) &&
+            (accelChipId == BMI088_ACCEL_CHIP_ID || accelChipId == 0x1F))
+        {
+            bmiAccelAddr = accelAddrCandidates[i];
+            accelFound = true;
+            break;
+        }
     }
 
-    if (!setBnoOperationMode(BNO055_OPERATION_MODE_CONFIG))
+    for (uint8_t i = 0; i < sizeof(gyroAddrCandidates); i++)
+    {
+        if (readBmiReg(gyroAddrCandidates[i], BMI088_CHIP_ID_ADDR, &gyroChipId, 1) && gyroChipId == BMI088_GYRO_CHIP_ID)
+        {
+            bmiGyroAddr = gyroAddrCandidates[i];
+            gyroFound = true;
+            break;
+        }
+    }
+
+    if (!accelFound)
         return false;
 
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
+    if (!setBnoOperationMode(0x00))
         return false;
 
-    if (!writeBnoReg(BNO055_SYS_TRIGGER_ADDR, 0x20))
+    if (!writeBmiReg(bmiAccelAddr, BMI088_ACCEL_SOFTRESET_ADDR, BMI088_ACCEL_SOFTRESET_CMD))
+        return false;
+    delay(50);
+
+    if (gyroFound)
+    {
+        if (!writeBmiReg(bmiGyroAddr, BMI088_GYRO_SOFTRESET_ADDR, BMI088_GYRO_SOFTRESET_CMD))
+            gyroFound = false;
+        delay(50);
+    }
+
+    if (!writeBmiReg(bmiAccelAddr, BMI088_ACCEL_PWR_CONF_ADDR, 0x00))
+        return false;
+    delay(5);
+
+    if (!writeBmiReg(bmiAccelAddr, BMI088_ACCEL_PWR_CTRL_ADDR, 0x04))
+        return false;
+    delay(5);
+
+    if (!writeBmiReg(bmiAccelAddr, BMI088_ACCEL_CONF_ADDR, 0xA8))
         return false;
 
-    delay(650);
-
-    if (!readBnoReg(BNO055_CHIP_ID_ADDR, &chipId, 1) || chipId != BNO055_CHIP_ID)
+    if (!writeBmiReg(bmiAccelAddr, BMI088_ACCEL_RANGE_ADDR, 0x01))
         return false;
 
-    if (!writeBnoReg(BNO055_PWR_MODE_ADDR, BNO055_POWER_MODE_NORMAL))
-        return false;
+    if (gyroFound)
+    {
+        if (!writeBmiReg(bmiGyroAddr, BMI088_GYRO_RANGE_ADDR, 0x04) ||
+            !writeBmiReg(bmiGyroAddr, BMI088_GYRO_BW_ADDR, 0x07) ||
+            !writeBmiReg(bmiGyroAddr, BMI088_GYRO_LPM1_ADDR, 0x00))
+        {
+            gyroFound = false;
+        }
+        delay(30);
+    }
 
-    delay(10);
-
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
-        return false;
-
-    if (!writeBnoReg(BNO055_UNIT_SEL_ADDR, 0x00))
-        return false;
-
-    if (!writeBnoReg(BNO055_SYS_TRIGGER_ADDR, 0x00))
-        return false;
-
-    delay(10);
-
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x01))
-        return false;
-
-    if (!writeBnoReg(BNO055_ACC_CONFIG_ADDR, 0x0D))
-        return false;
-
-    if (!writeBnoReg(BNO055_GYR_CONFIG0_ADDR, 0x10))
-        return false;
-
-    if (!writeBnoReg(BNO055_PAGE_ID_ADDR, 0x00))
-        return false;
-
-    delay(10);
-
-    if (!setBnoOperationMode(BNO055_OPERATION_MODE_ACCGYRO))
+    if (!setBnoOperationMode(0x01))
         return false;
 
     return true;
@@ -136,26 +158,30 @@ bool readBnoRawAccelGyro(float &accelX_mps2,
     uint8_t accelRaw[6];
     uint8_t gyroRaw[6];
 
-    if (!readBnoReg(BNO055_ACCEL_DATA_X_LSB_ADDR, accelRaw, sizeof(accelRaw)))
+    if (!readBmiReg(bmiAccelAddr, BMI088_ACCEL_DATA_X_LSB_ADDR, accelRaw, sizeof(accelRaw)))
         return false;
-    if (!readBnoReg(BNO055_GYRO_DATA_X_LSB_ADDR, gyroRaw, sizeof(gyroRaw)))
-        return false;
+
+    bool gyroOk = readBmiReg(bmiGyroAddr, BMI088_GYRO_DATA_X_LSB_ADDR, gyroRaw, sizeof(gyroRaw));
 
     int16_t accX = decodeBnoInt16(accelRaw[0], accelRaw[1]);
     int16_t accY = decodeBnoInt16(accelRaw[2], accelRaw[3]);
     int16_t accZ = decodeBnoInt16(accelRaw[4], accelRaw[5]);
 
-    int16_t gyrX = decodeBnoInt16(gyroRaw[0], gyroRaw[1]);
-    int16_t gyrY = decodeBnoInt16(gyroRaw[2], gyroRaw[3]);
-    int16_t gyrZ = decodeBnoInt16(gyroRaw[4], gyroRaw[5]);
+    int16_t gyrX = gyroOk ? decodeBnoInt16(gyroRaw[0], gyroRaw[1]) : 0;
+    int16_t gyrY = gyroOk ? decodeBnoInt16(gyroRaw[2], gyroRaw[3]) : 0;
+    int16_t gyrZ = gyroOk ? decodeBnoInt16(gyroRaw[4], gyroRaw[5]) : 0;
 
-    accelX_mps2 = static_cast<float>(accX) / 100.0f;
-    accelY_mps2 = static_cast<float>(accY) / 100.0f;
-    accelZ_mps2 = static_cast<float>(accZ) / 100.0f;
+    const float BMI088_ACCEL_LSB_PER_G = 5460.0f;
+    const float BMI088_G = 9.80665f;
+    const float BMI088_GYRO_LSB_PER_DPS = 262.4f;
 
-    gyroX_dps = static_cast<float>(gyrX) / 16.0f;
-    gyroY_dps = static_cast<float>(gyrY) / 16.0f;
-    gyroZ_dps = static_cast<float>(gyrZ) / 16.0f;
+    accelX_mps2 = (static_cast<float>(accX) / BMI088_ACCEL_LSB_PER_G) * BMI088_G;
+    accelY_mps2 = (static_cast<float>(accY) / BMI088_ACCEL_LSB_PER_G) * BMI088_G;
+    accelZ_mps2 = (static_cast<float>(accZ) / BMI088_ACCEL_LSB_PER_G) * BMI088_G;
+
+    gyroX_dps = static_cast<float>(gyrX) / BMI088_GYRO_LSB_PER_DPS;
+    gyroY_dps = static_cast<float>(gyrY) / BMI088_GYRO_LSB_PER_DPS;
+    gyroZ_dps = static_cast<float>(gyrZ) / BMI088_GYRO_LSB_PER_DPS;
 
     return true;
 }
@@ -610,6 +636,8 @@ void loop()
             float gyroX_dps = 0.0f;
             float gyroY_dps = 0.0f;
             float gyroZ_dps = 0.0f;
+            float rollDeg = 0.0f;
+            float pitchDeg = 0.0f;
 
             if (bnoReady)
             {
@@ -642,6 +670,8 @@ void loop()
 
                 float roll = atan2f(accelY, accelZ);
                 float pitch = atan2f(-accelX, sqrtf((accelY * accelY) + (accelZ * accelZ)));
+                rollDeg = roll * RAD2DEG;
+                pitchDeg = pitch * RAD2DEG;
                 float mxh = (mx * cosf(pitch)) + (mz * sinf(pitch));
                 float myh = (mx * sinf(roll) * sinf(pitch)) + (my * cosf(roll)) - (mz * sinf(roll) * cosf(pitch));
                 float heading_tilt = wrap360(atan2f(myh, mxh) * 180.0f / M_PI);
@@ -709,7 +739,19 @@ void loop()
             {
                 lastPrintTime = currentMillis;
 
-                float heading_output = yawInitialized ? fusedYawDeg : heading_fused;
+                float heading_output = imuSampleValid
+                                           ? (yawInitialized ? fusedYawDeg : heading_fused)
+                                           : heading_mag;
+
+                if (imuSampleValid)
+                {
+                    Serial.print("IMU Roll:"); Serial.print(rollDeg, 1);
+                    Serial.print(" Pitch:"); Serial.println(pitchDeg, 1);
+                }
+                else
+                {
+                    Serial.println("IMU Roll:N/A Pitch:N/A");
+                }
 
                 Serial.print("BMM350 X:"); Serial.print(x_corrected, 2);
                 Serial.print(" Y:"); Serial.print(y_corrected, 2);
